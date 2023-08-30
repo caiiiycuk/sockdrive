@@ -161,5 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     layer.flush();
+    println!("drive is flushed, sockdrive is stopping...");
+    
     Ok(())
 }
