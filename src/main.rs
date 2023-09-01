@@ -72,10 +72,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     return;
                                 }
 
-                                if stream.write_u8(0).await.is_err() {
-                                    return;
-                                }
-
                                 if write_tx
                                     .send(WriteRequest {
                                         sector,
@@ -109,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             match write_rx.try_recv() {
                 Ok(request) => {
-                    total_reads += 1;
+                    total_writes += 1;
                     layer.write(request.sector, &request.bytes);
                 }
                 _ => {
@@ -122,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut bytes: [u8; SECTOR_SIZE] = [0; SECTOR_SIZE];
             match read_rx.try_recv() {
                 Ok(request) => {
-                    total_writes += 1;
+                    total_reads += 1;
                     layer.read(request.sector, &mut bytes);
                     let _ = request
                         .sender
