@@ -19,7 +19,6 @@ uint8_t sockdrive_read(size_t handle, uint32_t sector, uint8_t *buffer) {
     }
 
     TCPsocket socket = getSocket(handle);
-    static uint8_t recv[sectorSize];
     static const uint8_t readCommand = 1;
     if (SDLNet_TCP_Send(socket, &readCommand, sizeof(uint8_t)) != sizeof(uint8_t)) {
         return 1;
@@ -27,10 +26,9 @@ uint8_t sockdrive_read(size_t handle, uint32_t sector, uint8_t *buffer) {
     if (SDLNet_TCP_Send(socket, &sector, sizeof(uint32_t)) != sizeof(uint32_t)) {
         return 1;
     }
-    if (SDLNet_TCP_Recv(socket, recv, sectorSize) != sectorSize) {
+    if (SDLNet_TCP_Recv(socket, buffer, sectorSize) != sectorSize) {
         return 1;
     }
-    memcpy(buffer, recv, sectorSize);
     return 0;
 }
 
@@ -41,19 +39,13 @@ uint8_t sockdrive_write(size_t handle, uint32_t sector, uint8_t* buffer) {
 
     TCPsocket socket = getSocket(handle);
     static const uint8_t writeCommand = 2;
-    static uint8_t send[sectorSize];
-    static uint8_t recv;
-    memcpy(send, buffer, sectorSize);
     if (SDLNet_TCP_Send(socket, &writeCommand, sizeof(uint8_t)) != sizeof(uint8_t)) {
         return 1;
     }
     if (SDLNet_TCP_Send(socket, &sector, sizeof(uint32_t)) != sizeof(uint32_t)) {
         return 1;
     }
-    if (SDLNet_TCP_Send(socket, &send, sectorSize) != sectorSize) {
-        return 1;
-    }
-    if (SDLNet_TCP_Recv(socket, &recv, sizeof(uint8_t)) != sizeof(uint8_t)) {
+    if (SDLNet_TCP_Send(socket, buffer, sectorSize) != sectorSize) {
         return 1;
     }
     return 0;
