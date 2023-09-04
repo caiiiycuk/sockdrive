@@ -14,7 +14,13 @@ EM_ASYNC_JS(size_t, sockdrive_open, (const char* host, uint16_t port), {
             writeBuffer: new Uint8Array(1 + 4 + 512),
             resolveRead: null,
             readPtr: null,
+            readStartedAt: null,
             map: {},
+            stats: {
+                read: 0,
+                write: 0,
+                readTotalTime: 0,
+            },
         }
     };
     
@@ -51,6 +57,8 @@ EM_ASYNC_JS(size_t, sockdrive_open, (const char* host, uint16_t port), {
                     Module.sockdrive.resolveRead(0);
                     Module.sockdrive.resolveRead = null;
                     Module.sockdrive.readPtr = null;
+                    Module.sockdrive.stats.read += 512;
+                    Module.sockdrive.stats.readTotalTime += Date.now() - Module.sockdrive.readStartedAt;
                 }
             } else {
                 console.error("sockdrive received unknown message");
@@ -73,6 +81,7 @@ EM_ASYNC_JS(uint8_t, sockdrive_read, (size_t handle, uint32_t sector, uint8_t * 
                 console.error("not a sockdrive handle");
                 resolve(1);
            } else {
+                Module.sockdrive.readStartedAt = Date.now();
                 Module.sockdrive.resolveRead = resolve;
                 Module.sockdrive.readPtr = buffer;
 
@@ -97,6 +106,7 @@ EM_ASYNC_JS(uint8_t, sockdrive_write, (size_t handle, uint32_t sector, uint8_t *
             if (!socket) {
                 console.error("not a sockdrive handle");
             } else {
+                Module.sockdrive.stats.write += 512;
                 Module.sockdrive.writeBuffer[0] = 2;
                 Module.sockdrive.writeBuffer[1] = sector & 0xFF;
                 Module.sockdrive.writeBuffer[2] = (sector >> 8) & 0xFF;
