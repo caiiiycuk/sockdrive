@@ -13,12 +13,17 @@ use layer::{Layer, SECTOR_SIZE};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     struct ReadRequest {
         sector: u32,
-        sender: mpsc::Sender<WriteRequest>,
+        ahead: u8,
+        sender: mpsc::Sender<SectorResponse>,
     }
 
     struct WriteRequest {
         sector: u32,
         bytes: [u8; SECTOR_SIZE],
+    }
+
+    struct SectorResponse {
+        bytes: Vec<u8>,
     }
 
     let live = Arc::new(AtomicBool::new(true));
@@ -42,15 +47,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok((mut stream, _)) = listener.accept().await {
                 let read_tx = read_tx.clone();
                 let write_tx = write_tx.clone();
-                let (sector_tx, mut sector_rx) = mpsc::channel::<WriteRequest>(1);
+                let (sector_tx, mut sector_rx) = mpsc::channel::<SectorResponse>(1);
                 tokio::spawn(async move {
                     loop {
                         let mut sector_buf: [u8; SECTOR_SIZE] = [0; SECTOR_SIZE];
                         match (stream.read_u8().await, stream.read_u32_le().await) {
                             (Ok(1), Ok(sector)) => {
-                                if read_tx
+                                let ahead = stream.read_u8().await;
+                                if ahead.is_err() ||  read_tx
                                     .send(ReadRequest {
                                         sector,
+                                        ahead: ahead.unwrap(),
                                         sender: sector_tx.clone(),
                                     })
                                     .await
@@ -59,8 +66,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     return;
                                 }
 
-                                if let Some(sector) = sector_rx.recv().await {
-                                    if stream.write_all(&sector.bytes).await.is_err() {
+                                if let Some(response) = sector_rx.recv().await {
+                                    if sector == 0 {
+                                        println!(">> size: {}, {} {} {} {} {}", response.bytes.len(), response.bytes[0], response.bytes[1], 
+                                            response.bytes[2], response.bytes[3], response.bytes[4])
+                                    }
+                                    if stream.write_all(&response.bytes).await.is_err() {
                                         return;
                                     }
                                 } else {
@@ -101,6 +112,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut reported_reads = 0;
     let mut reported_writes = 0;
     let mut reported_sleep_times = 0;
+    let mut read_buffer: [u8; SECTOR_SIZE] = [0; SECTOR_SIZE];
+
     while live.load(Ordering::Relaxed) {
         loop {
             match write_rx.try_recv() {
@@ -115,15 +128,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         loop {
-            let mut bytes: [u8; SECTOR_SIZE] = [0; SECTOR_SIZE];
             match read_rx.try_recv() {
                 Ok(request) => {
                     total_reads += 1;
-                    layer.read(request.sector, &mut bytes);
+                    let mut bytes: Vec<u8> = Vec::new();
+                    for i in 0..request.ahead {
+                        // TODO maybe is better to allocate vector and not use extend
+                        layer.read(request.sector + i as u32, &mut read_buffer);
+                        bytes.extend(read_buffer);
+                    }
+                    debug_assert!(bytes.len() == SECTOR_SIZE * request.ahead as usize);
+                    if request.sector == 0 {
+                        println!("size: {}, {} {} {} {} {}", bytes.len(), bytes[0], bytes[1], bytes[2], bytes[3], bytes[4])
+                    }
                     let _ = request
                         .sender
-                        .send(WriteRequest {
-                            sector: request.sector,
+                        .send(SectorResponse {
                             bytes,
                         })
                         .await;
@@ -139,8 +159,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             || sleep_times - reported_sleep_times > 1000
         {
             println!(
-                "Reads {}, Writes {}, Sleeps {}",
-                total_reads, total_writes, sleep_times
+            "Reads {}, Writes {}, Sleeps {}",
+            total_reads, total_writes, sleep_times
             );
             reported_reads = total_reads;
             reported_writes = total_writes;

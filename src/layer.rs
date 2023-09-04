@@ -56,14 +56,13 @@ impl Layer {
 
     pub fn read(&mut self, sector: u32, buffer: &mut [u8; SECTOR_SIZE]) {
         let offset = self.offsets[sector as usize] as u64;
-        if offset == NO_VALUE_64 {
-            buffer.fill(0);
-        } else {
+        if offset != NO_VALUE_64 {
             if self.pos != offset {
                 self.blob.seek(Start(offset)).expect("Can't seek to sector");
             }
             self.blob.read_exact(buffer).expect("Can't read sector");
-            self.pos += offset + SECTOR_SIZE_64;
+            self.pos = offset + SECTOR_SIZE_64;
+            debug_assert!(self.blob.seek(Current(0)).unwrap() == self.pos);
         }
     }
 
@@ -79,6 +78,7 @@ impl Layer {
         }
         self.blob.write_all(buffer).expect("Can't write sector");
         self.pos = offset + SECTOR_SIZE_64;
+        debug_assert!(self.blob.seek(Current(0)).unwrap() == self.pos);
     }
 
     pub fn flush(&mut self) {
@@ -99,9 +99,10 @@ impl Layer {
 
 #[cfg(test)]
 mod tests {
-    use crate::layer::NO_VALUE;
-
     use super::{Layer, SECTOR_SIZE};
+    use crate::layer::NO_VALUE;
+    use rand::seq::SliceRandom;
+    use rand::thread_rng;
 
     #[test]
     fn create_write_read_test() {
@@ -111,25 +112,36 @@ mod tests {
         let _ = std::fs::remove_file(&meta_file);
         let _ = std::fs::remove_file(&blob_file);
 
+        let mut sector_sec: Vec<u32> = (0..4096).collect();
+        sector_sec.shuffle(&mut thread_rng());
+
         {
-            let mut layer = Layer::new(layer_file, 16);
+            let mut layer = Layer::new(layer_file, sector_sec.len());
             let mut buffer: [u8; SECTOR_SIZE] = [0; SECTOR_SIZE];
-            for i in 0..16 {
-                assert_eq!(layer.offsets[i as usize], NO_VALUE);
-                buffer[0] = i as u8;
-                layer.write(i, &buffer);
-                assert_eq!(layer.offsets[i as usize], i * SECTOR_SIZE as u32);
+            let mut index = 0;
+            for sector in sector_sec.clone() {
+                assert_eq!(layer.offsets[sector as usize], NO_VALUE);
+                for i in 0..SECTOR_SIZE {
+                    buffer[i] = sector as u8;
+                }
+                layer.write(sector as u32, &buffer);
+                assert_eq!(layer.offsets[sector as usize] as usize, index * SECTOR_SIZE);
+                index += 1;
             }
             layer.flush();
         }
 
         {
-            let mut layer = Layer::new(layer_file, 16);
+            let mut layer = Layer::new(layer_file, sector_sec.len());
             let mut buffer: [u8; SECTOR_SIZE] = [0; SECTOR_SIZE];
-            for i in 0..16 {
-                assert_eq!(layer.offsets[i as usize], i * SECTOR_SIZE as u32);
-                layer.read(i, &mut buffer);
-                assert_eq!(buffer[0], i as u8);
+            let mut index = 0;
+            for sector in sector_sec.clone() {
+                assert_eq!(layer.offsets[sector as usize] as usize, index * SECTOR_SIZE);
+                layer.read(sector as u32, &mut buffer);
+                for i in 0..SECTOR_SIZE {
+                    assert_eq!(buffer[i], sector as u8);
+                }
+                index += 1;
             }
             layer.flush();
         }
