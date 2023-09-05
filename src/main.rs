@@ -138,9 +138,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         bytes.extend(read_buffer);
                     }
                     debug_assert!(bytes.len() == SECTOR_SIZE * request.ahead as usize);
-                    if request.sector == 0 {
-                        println!("size: {}, {} {} {} {} {}", bytes.len(), bytes[0], bytes[1], bytes[2], bytes[3], bytes[4])
-                    }
                     let _ = request
                         .sender
                         .send(SectorResponse {
