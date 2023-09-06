@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .expect("Error setting Ctrl-C handler");
 
     let mut layer = Layer::new("drive-0", 2048 / SECTOR_SIZE * 1024 * 1024);
-    let listener = TcpListener::bind("0.0.0.0:8000").await?;
+    let listener = TcpListener::bind("0.0.0.0:8002").await?;
 
     println!("sockdrive is started");
 
@@ -67,10 +67,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
 
                                 if let Some(response) = sector_rx.recv().await {
-                                    if sector == 0 {
-                                        println!(">> size: {}, {} {} {} {} {}", response.bytes.len(), response.bytes[0], response.bytes[1], 
-                                            response.bytes[2], response.bytes[3], response.bytes[4])
-                                    }
                                     if stream.write_all(&response.bytes).await.is_err() {
                                         return;
                                     }
