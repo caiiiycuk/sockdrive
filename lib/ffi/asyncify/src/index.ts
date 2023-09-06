@@ -3,7 +3,6 @@ import { Drive } from "./drive";
 
 declare const Module: any;
 
-
 (function () {
     let seq = 0;
     const mapping: { [handle: Handle]: Drive } = {};
@@ -11,7 +10,10 @@ declare const Module: any;
         read: 0,
         write: 0,
         readTotalTime: 0,
-    }
+        cacheHit: 0,
+        cacheMiss: 0,
+        cacheUsed: 0,
+    };
     Module.sockdrive = {
         stats,
         open: (host: string, port: number): Promise<Handle> => {

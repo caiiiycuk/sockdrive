@@ -1,5 +1,5 @@
-import { resolve } from "path";
-import { Handle, Ptr, Stats } from "./types";
+import { Ptr, Stats } from "./types";
+import { Cache } from "./cache";
 
 declare const Module: { HEAPU8: Uint8Array };
 
@@ -27,7 +27,9 @@ export class Drive {
     readAheadPos: 0;
     readStartedAt: number;
 
-    public constructor(url: string, stats: Stats, aheadRange = 64, memoryLimit = 32 * 1024 * 1024) {
+    cache: Cache;
+
+    public constructor(url: string, stats: Stats, aheadRange = 127, memoryLimit = 32 * 1024 * 1024) {
         this.url = url;
         this.request = null;
         this.readBuffer = new Uint8Array(1 + 4 + 1);
@@ -35,6 +37,7 @@ export class Drive {
         this.readAheadBuffer = new Uint8Array(this.sectorSize * aheadRange),
             this.stats = stats;
         this.aheadRange = aheadRange;
+        this.cache = new Cache(this.sectorSize, aheadRange, memoryLimit);
 
         this.reconnect();
     }
@@ -66,6 +69,20 @@ export class Drive {
     }
 
     public read(sector: number, buffer: Ptr): Promise<number> {
+        if (this.request !== null && this.request.type === 1) {
+            console.error("New read request while old one is still processed");
+            return Promise.resolve(3);
+        }
+
+        const cached = this.cache.read(sector);
+        if (cached !== null) {
+            this.stats.cacheHit++;
+            this.request = null;
+            Module.HEAPU8.set(cached, buffer);
+            return Promise.resolve(0);
+        }
+        this.stats.cacheMiss++;
+
         return new Promise<number>((resolve) => {
             this.request = {
                 type: 1,
@@ -85,6 +102,7 @@ export class Drive {
                 buffer: Module.HEAPU8.slice(buffer, buffer + this.sectorSize),
                 resolve,
             };
+            this.cache.write(sector, this.request.buffer as Uint8Array);
             this.executeRequest(this.request);
         });
     }
@@ -100,14 +118,15 @@ export class Drive {
         this.socket.then((socket) => {
             if (request.type === 1) {
                 const { sector } = request;
+                const origin = this.cache.getOrigin(sector);
                 this.readStartedAt = Date.now();
                 this.readAheadPos = 0;
 
                 this.readBuffer[0] = 1; // read
-                this.readBuffer[1] = sector & 0xFF;
-                this.readBuffer[2] = (sector >> 8) & 0xFF;
-                this.readBuffer[3] = (sector >> 16) & 0xFF;
-                this.readBuffer[4] = (sector >> 24) & 0xFF;
+                this.readBuffer[1] = origin & 0xFF;
+                this.readBuffer[2] = (origin >> 8) & 0xFF;
+                this.readBuffer[3] = (origin >> 16) & 0xFF;
+                this.readBuffer[4] = (origin >> 24) & 0xFF;
                 this.readBuffer[5] = this.aheadRange;
                 socket.send(this.readBuffer.buffer);
             } else {
@@ -142,8 +161,14 @@ export class Drive {
                 this.readAheadPos += event.data.byteLength;
 
                 if (this.readAheadPos == this.readAheadBuffer.length) {
-                    const { buffer, resolve } = this.request;
-                    Module.HEAPU8.set(new Uint8Array(this.readAheadBuffer.slice(0, this.sectorSize)), buffer as number);
+                    const { sector, buffer, resolve } = this.request;
+                    const origin = this.cache.getOrigin(sector);
+                    this.cache.create(origin, this.readAheadBuffer);
+                    this.stats.cacheUsed = this.cache.memUsed();
+                    const offset = sector - origin;
+                    Module.HEAPU8.set(
+                        this.readAheadBuffer.slice(offset * this.sectorSize, (offset + 1) * this.sectorSize), 
+                        buffer as number);
                     this.stats.read += this.sectorSize * this.aheadRange;
                     this.stats.readTotalTime += Date.now() - this.readStartedAt;
                     this.request = null;

@@ -1,4 +1,3 @@
-import { read } from "fs";
 import { LRUMap } from "./lru";
 
 export class Cache {
@@ -7,41 +6,40 @@ export class Cache {
     sectorSize: number;
     lru: LRUMap;
 
-    constructor(aheadRange: number, memoryLimit: number, sectorSize: number) {
+    constructor(sectorSize: number, aheadRange: number, memoryLimit: number) {
         this.aheadRange = aheadRange;
         this.sectorSize = sectorSize;
         this.lru = new LRUMap(Math.floor(memoryLimit / (aheadRange * sectorSize)));
     }
 
     public read(sector: number): Uint8Array | null {
-        const cached = this.lru.get(this.getOrigin(sector));
+        const origin = this.getOrigin(sector);
+        const cached = this.lru.get(origin) as Uint8Array;
         if (cached) {
-            const offset = this.getOffset(sector);
+            const offset = sector - origin;
             return cached.slice(offset * this.sectorSize, (offset + 1) * this.sectorSize);
         }
         return null;
     }
 
     public write(sector: number, buffer: Uint8Array) {
-        const cached = this.lru.get(this.getOrigin(sector));
+        const origin = this.getOrigin(sector);
+        const cached = this.lru.get(origin);
         if (cached) {
-            const offset = this.getOffset(sector);
-            cached.set(buffer, offset * this.sectorSize);
+            cached.set(buffer, (sector - origin) * this.sectorSize);
         }
     }
 
     public create(origin: number, buffer: Uint8Array) {
-        if (!this.lru.get(origin)) {
-            this.lru.set(origin, buffer);
-        }
+        this.lru.set(origin, buffer.slice(0));
     }
 
     public getOrigin(sector: number) {
-        return Math.floor(sector / this.aheadRange);
+        return sector - sector % this.aheadRange;
     }
 
-    getOffset(sector: number) {
-        return sector % this.aheadRange;
+    public memUsed() {
+        return this.lru.size * this.aheadRange * this.sectorSize;
     }
 
 }
