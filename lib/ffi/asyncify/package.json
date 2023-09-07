@@ -5,6 +5,8 @@
   "license": "GPLv3",
   "private": true,
   "devDependencies": {
+    "eslint": "^8.48.0",
+    "eslint-webpack-plugin": "^4.0.1",
     "ts-loader": "^9.4.4",
     "typescript": "^5.2.2",
     "webpack": "^5.88.2",

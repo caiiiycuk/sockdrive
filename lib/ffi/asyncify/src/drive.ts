@@ -1,5 +1,5 @@
 import { Ptr, Stats } from "./types";
-import { Cache } from "./cache";
+import { BlockAndWriteCache, BlockCache, Cache, SimpleCache } from "./cache";
 
 declare const Module: { HEAPU8: Uint8Array };
 
@@ -29,7 +29,7 @@ export class Drive {
 
     cache: Cache;
 
-    public constructor(url: string, stats: Stats, aheadRange = 127, memoryLimit = 32 * 1024 * 1024) {
+    public constructor(url: string, stats: Stats, aheadRange = 255, memoryLimit = 32 * 1024 * 1024) {
         this.url = url;
         this.request = null;
         this.readBuffer = new Uint8Array(1 + 4 + 1);
@@ -37,7 +37,7 @@ export class Drive {
         this.readAheadBuffer = new Uint8Array(this.sectorSize * aheadRange),
             this.stats = stats;
         this.aheadRange = aheadRange;
-        this.cache = new Cache(this.sectorSize, aheadRange, memoryLimit);
+        this.cache = new BlockCache(this.sectorSize, aheadRange, memoryLimit);
 
         this.reconnect();
     }
@@ -68,19 +68,24 @@ export class Drive {
         }
     }
 
-    public read(sector: number, buffer: Ptr): Promise<number> {
+    public read(sector: number, buffer: Ptr, sync: boolean): Promise<number> | number {
         if (this.request !== null && this.request.type === 1) {
             console.error("New read request while old one is still processed");
-            return Promise.resolve(3);
+            return sync ? 3 : Promise.resolve(3);
         }
 
         const cached = this.cache.read(sector);
         if (cached !== null) {
-            this.stats.cacheHit++;
+            if (sync) {
+                this.stats.cacheHit++;
+            } 
             this.request = null;
             Module.HEAPU8.set(cached, buffer);
-            return Promise.resolve(0);
+            return sync ? 0 : Promise.resolve(0);
+        } else if (sync) {
+            return 255;
         }
+
         this.stats.cacheMiss++;
 
         return new Promise<number>((resolve) => {
@@ -94,17 +99,17 @@ export class Drive {
         });
     }
 
-    public write(sector: number, buffer: Ptr): Promise<number> {
-        return new Promise<number>((resolve) => {
-            this.request = {
-                type: 2,
-                sector,
-                buffer: Module.HEAPU8.slice(buffer, buffer + this.sectorSize),
-                resolve,
-            };
-            this.cache.write(sector, this.request.buffer as Uint8Array);
-            this.executeRequest(this.request);
-        });
+    public write(sector: number, buffer: Ptr): number {
+        this.request = {
+            type: 2,
+            sector,
+            buffer: Module.HEAPU8.slice(buffer, buffer + this.sectorSize),
+            resolve: () => { /**/ },
+        };
+        this.cache.write(sector, this.request.buffer as Uint8Array);
+        this.executeRequest(this.request);
+
+        return 0;
     }
 
     public close() {
@@ -167,7 +172,7 @@ export class Drive {
                     this.stats.cacheUsed = this.cache.memUsed();
                     const offset = sector - origin;
                     Module.HEAPU8.set(
-                        this.readAheadBuffer.slice(offset * this.sectorSize, (offset + 1) * this.sectorSize), 
+                        this.readAheadBuffer.slice(offset * this.sectorSize, (offset + 1) * this.sectorSize),
                         buffer as number);
                     this.stats.read += this.sectorSize * this.aheadRange;
                     this.stats.readTotalTime += Date.now() - this.readStartedAt;

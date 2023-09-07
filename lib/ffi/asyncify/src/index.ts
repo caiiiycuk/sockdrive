@@ -16,27 +16,27 @@ declare const Module: any;
     };
     Module.sockdrive = {
         stats,
-        open: (host: string, port: number): Promise<Handle> => {
+        open: (host: string, port: number): Handle => {
             seq++;
             mapping[seq] = new Drive("ws://" + host + ":" + port, stats);
-            return Promise.resolve(seq);
+            return seq;
         },
 
-        read: (handle: Handle, sector: number, buffer: Ptr): Promise<number> => {
+        read: (handle: Handle, sector: number, buffer: Ptr, sync: boolean): Promise<number> | number => {
             if (mapping[handle]) {
-                return mapping[handle].read(sector, buffer);
+                return mapping[handle].read(sector, buffer, sync);
             }
 
             console.error("ERROR! sockdrive handle", handle, "not found");
-            return Promise.resolve(1);
+            return sync ? 1 : Promise.resolve(1);
         },
 
-        write: (handle: Handle, sector: number, buffer: Ptr): Promise<number> => {
+        write: (handle: Handle, sector: number, buffer: Ptr): number => {
             if  (mapping[handle]) {
                 return mapping[handle].write(sector, buffer);
             }
             console.error("ERROR! sockdrive handle", handle, "not found");
-            return Promise.resolve(1);
+            return 1;
         },
 
         close: (handle: Handle) => {
