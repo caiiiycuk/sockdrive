@@ -1,10 +1,11 @@
 use ctrlc;
+use lz4_flex::block::compress_prepend_size;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 mod layer;
 use layer::{Layer, SECTOR_SIZE};
@@ -54,14 +55,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match (stream.read_u8().await, stream.read_u32_le().await) {
                             (Ok(1), Ok(sector)) => {
                                 let ahead = stream.read_u8().await;
-                                if ahead.is_err() ||  read_tx
-                                    .send(ReadRequest {
-                                        sector,
-                                        ahead: ahead.unwrap(),
-                                        sender: sector_tx.clone(),
-                                    })
-                                    .await
-                                    .is_err()
+                                if ahead.is_err()
+                                    || read_tx
+                                        .send(ReadRequest {
+                                            sector,
+                                            ahead: ahead.unwrap(),
+                                            sender: sector_tx.clone(),
+                                        })
+                                        .await
+                                        .is_err()
                                 {
                                     return;
                                 }
@@ -100,6 +102,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let mut original_size: f64 = 1.0;
+    let mut compressed_size: f64 = 0.0;
     let mut prev_total_reads = 0;
     let mut prev_total_writes = 0;
     let mut total_reads = 0;
@@ -133,12 +137,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         layer.read(request.sector + i as u32, &mut read_buffer);
                         bytes.extend(read_buffer);
                     }
+                    original_size += bytes.len() as f64;
                     debug_assert!(bytes.len() == SECTOR_SIZE * request.ahead as usize);
+                    let mut compressed = compress_prepend_size(&bytes);
+                    let mut compressed_len = compressed.len() - 4;
+                    if compressed_len >= bytes.len() {
+                        compressed.truncate(bytes.len() + 4);
+                        compressed[4..].copy_from_slice(&bytes);
+                        compressed_len = compressed.len() - 4;
+                    }
+                    compressed_size += compressed_len as f64;
+                    compressed[0] = (compressed_len & 0xFF) as u8;
+                    compressed[1] = ((compressed_len >> 8) & 0xFF) as u8;
+                    compressed[2] = ((compressed_len >> 16) & 0xFF) as u8;
+                    compressed[3] = ((compressed_len >> 24) & 0xFF) as u8;
                     let _ = request
                         .sender
-                        .send(SectorResponse {
-                            bytes,
-                        })
+                        .send(SectorResponse { bytes: compressed })
                         .await;
                 }
                 _ => {
@@ -152,8 +167,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             || sleep_times - reported_sleep_times > 1000
         {
             println!(
-            "Reads {}, Writes {}, Sleeps {}",
-            total_reads, total_writes, sleep_times
+                "Reads {}, Writes {}, Sleeps {}, Compression {:.2}%",
+                total_reads,
+                total_writes,
+                sleep_times,
+                (1.0 - compressed_size / original_size) * 100.0
             );
             reported_reads = total_reads;
             reported_writes = total_writes;
@@ -171,6 +189,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     layer.flush();
     println!("drive is flushed, sockdrive is stopping...");
-    
+
     Ok(())
 }

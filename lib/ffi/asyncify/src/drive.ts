@@ -1,7 +1,12 @@
 import { Ptr, Stats } from "./types";
-import { BlockAndWriteCache, BlockCache, Cache, SimpleCache } from "./cache";
+import { BlockCache, Cache } from "./cache";
 
-declare const Module: { HEAPU8: Uint8Array };
+declare const Module: {
+    HEAPU8: Uint8Array,
+    _malloc: (len: number) => Ptr,
+    _free: (ptr: Ptr) => void,
+    _decode_lz4_block: (compressedSize: number, decodedSize: number, ptr: Ptr) => number,
+};
 
 interface Request {
     type: 1 | 2, // read | write
@@ -20,11 +25,13 @@ export class Drive {
     request: Request | null;
 
     aheadRange: number;
+    aheadSize: number;
     writeBuffer: Uint8Array;
 
     readBuffer: Uint8Array;
-    readAheadBuffer: Uint8Array;
-    readAheadPos: 0;
+    readAheadBuffer: Ptr;
+    readAheadPos = 0;
+    readAheadCompressed = 0;
     readStartedAt: number;
 
     cache: Cache;
@@ -34,9 +41,10 @@ export class Drive {
         this.request = null;
         this.readBuffer = new Uint8Array(1 + 4 + 1);
         this.writeBuffer = new Uint8Array(1 + 4 + this.sectorSize);
-        this.readAheadBuffer = new Uint8Array(this.sectorSize * aheadRange),
-            this.stats = stats;
+        this.readAheadBuffer = Module._malloc(this.sectorSize * aheadRange);
+        this.stats = stats;
         this.aheadRange = aheadRange;
+        this.aheadSize = aheadRange * this.sectorSize;
         this.cache = new BlockCache(this.sectorSize, aheadRange, memoryLimit);
 
         this.reconnect();
@@ -78,7 +86,7 @@ export class Drive {
         if (cached !== null) {
             if (sync) {
                 this.stats.cacheHit++;
-            } 
+            }
             this.request = null;
             Module.HEAPU8.set(cached, buffer);
             return sync ? 0 : Promise.resolve(0);
@@ -115,8 +123,11 @@ export class Drive {
     public close() {
         this.socket
             .then((s) => s.close())
-            .catch((e) => console.error("Can't close socket", e));
-
+            .catch((e) => console.error("Can't close socket", e))
+            .finally(() => {
+                Module._free(this.readAheadBuffer);
+                this.readAheadBuffer = 0;
+            });
     }
 
     private executeRequest(request: Request) {
@@ -126,6 +137,7 @@ export class Drive {
                 const origin = this.cache.getOrigin(sector);
                 this.readStartedAt = Date.now();
                 this.readAheadPos = 0;
+                this.readAheadCompressed = 0;
 
                 this.readBuffer[0] = 1; // read
                 this.readBuffer[1] = origin & 0xFF;
@@ -158,26 +170,39 @@ export class Drive {
             console.error("Received read payload while write request");
             this.reconnect();
         } else if (event.data instanceof ArrayBuffer) {
-            const restLength = this.readAheadBuffer.length - this.readAheadPos;
-            if (event.data.byteLength > restLength) {
-                console.error("wrong read payload length " + event.data.byteLength + " instead of " + restLength);
-            } else {
-                this.readAheadBuffer.set(new Uint8Array(event.data), this.readAheadPos);
-                this.readAheadPos += event.data.byteLength;
+            let data = new Uint8Array(event.data);
+            if (this.readAheadCompressed === 0) {
+                this.readAheadCompressed = data[0] + (data[1] << 8) + (data[2] << 16) + (data[3] << 24);
+                data = data.slice(4);
+            }
 
-                if (this.readAheadPos == this.readAheadBuffer.length) {
-                    const { sector, buffer, resolve } = this.request;
-                    const origin = this.cache.getOrigin(sector);
-                    this.cache.create(origin, this.readAheadBuffer);
-                    this.stats.cacheUsed = this.cache.memUsed();
-                    const offset = sector - origin;
-                    Module.HEAPU8.set(
-                        this.readAheadBuffer.slice(offset * this.sectorSize, (offset + 1) * this.sectorSize),
-                        buffer as number);
-                    this.stats.read += this.sectorSize * this.aheadRange;
-                    this.stats.readTotalTime += Date.now() - this.readStartedAt;
-                    this.request = null;
-                    resolve(0);
+            const { sector, buffer, resolve } = this.request;
+            const restLength = this.readAheadCompressed - this.readAheadPos;
+            if (data.byteLength > restLength || restLength < 0 || restLength > this.aheadSize) {
+                console.error("wrong read payload length " + data.byteLength + " instead of " + restLength);
+                resolve(3);
+            } else {
+                Module.HEAPU8.set(data, this.readAheadBuffer + this.readAheadPos);
+                this.readAheadPos += data.byteLength;
+
+                if (this.readAheadPos == this.readAheadCompressed) {
+                    const decodeResult = Module._decode_lz4_block(this.readAheadCompressed, this.aheadSize, this.readAheadBuffer);
+                    if (decodeResult != this.aheadSize) {
+                        console.error("wrong decode result " + decodeResult);
+                        resolve(4);
+                    } else {
+                        const origin = this.cache.getOrigin(sector);
+                        this.cache.create(origin, Module.HEAPU8.slice(this.readAheadBuffer, this.readAheadBuffer + this.aheadSize));
+                        this.stats.cacheUsed = this.cache.memUsed();
+                        const offset = sector - origin;
+                        Module.HEAPU8.set(
+                            Module.HEAPU8.slice(this.readAheadBuffer + offset * this.sectorSize, this.readAheadBuffer + (offset + 1) * this.sectorSize),
+                            buffer as number);
+                        this.stats.read += this.readAheadCompressed;
+                        this.stats.readTotalTime += Date.now() - this.readStartedAt;
+                        this.request = null;
+                        resolve(0);
+                    }
                 }
             }
         } else {
