@@ -5,7 +5,7 @@
 
 #include "../sockdrive.h"
 #include "emscripten.h"
-#include "lz4/lz4.h"
+#include "../lz4/lz4.h"
 
 const char *jsImpl = 
 #include "dist/bundle.js"

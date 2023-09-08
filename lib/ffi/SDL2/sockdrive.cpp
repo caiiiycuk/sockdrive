@@ -1,33 +1,168 @@
-#include "../sockdrive.h"
-#include "SDL_net.h"
+#include <cstdint>
+#include <cassert>
 #include <unordered_map>
+#include "LRUCache11.hpp"
 
-#define getSocket(handle) reinterpret_cast<TCPsocket>(handle)
+#include "../sockdrive.h"
+#include "../lz4/lz4.h"
+#include "SDL_net.h"
 
-// TODO replace with memory-limited cache
-// TODO make cache drive dependent
-// TODO fix memory leaking in cache! (each time it leaks)
-std::unordered_map<uint32_t, uint8_t*> sectorCache;
+namespace {
+    int SDLNet_TCP_Recv_All(TCPsocket sock, void *data, int maxlen) {
+        auto *start = (uint8_t *) data;
+        auto restlen = maxlen;
+        while (restlen > 0) {
+            auto read = SDLNet_TCP_Recv(sock, start, maxlen);
+            start += read;
+            restlen -= read;
+            // TODO: add sleep
+        }
+        return maxlen;
+    }
 
-constexpr uint16_t sectorSize = 512;
-constexpr uint8_t aheadRead = 128; // 64kb
+    int decode_lz4_block(uint32_t compressedSize, uint32_t decodedSize, char *buffer) {
+        if (compressedSize == decodedSize) {
+            return decodedSize;
+        }
 
-int SDLNet_TCP_Recv_All(TCPsocket sock, void *data, int maxlen) {
-   auto *start = (uint8_t*) data;
-   auto restlen = maxlen;
-   while (restlen > 0) {
-       auto readed = SDLNet_TCP_Recv(sock, start, maxlen);
-       start += readed;
-       restlen -= readed;
-       // TODO: add sleep
-   }
-   return maxlen;
+        // 128 * 1024 is for 255 aheadRange (maximum possible)
+        constexpr int compressedBuffer = 128 * 1024;
+        static char compressed[compressedBuffer];
+
+        if (compressedBuffer < compressedSize) {
+            return -1;
+        }
+
+        memcpy(compressed, buffer, compressedSize);
+        auto result = LZ4_decompress_safe(compressed, buffer, compressedSize, decodedSize);
+        return result;
+    }
+
+    class BlockCache {
+        const uint32_t sectorSize;
+        const uint8_t aheadRange;
+        lru11::Cache<uint32_t, std::unique_ptr<uint8_t>> lru;
+
+    public:
+        BlockCache(uint32_t sectorSize, uint8_t aheadRange, uint32_t memoryLimit) :
+                sectorSize(sectorSize), aheadRange(aheadRange), lru(memoryLimit / (aheadRange * sectorSize), 0) {
+        }
+
+        uint8_t *read(uint32_t sector) {
+            const auto origin = getOrigin(sector);
+            if (lru.contains(origin)) {
+                return lru.getRef(origin).get() + (sector - origin) * sectorSize;
+            }
+            return nullptr;
+        }
+
+        bool write(uint32_t sector, uint8_t *buffer) {
+            const auto origin = getOrigin(sector);
+            if (lru.contains(origin)) {
+                memcpy(lru.getRef(origin).get() + (sector - origin) * sectorSize, buffer, sectorSize);
+                return true;
+            }
+            return false;
+        }
+
+        void create(uint32_t origin, uint8_t *buffer) {
+            if (lru.contains(origin)) {
+                memcpy(lru.getRef(origin).get(), buffer, sectorSize * aheadRange);
+            } else {
+                auto copy = new uint8_t[sectorSize * aheadRange];
+                memcpy(copy, buffer, sectorSize * aheadRange);
+                lru.insert(origin, copy);
+            }
+        }
+
+        uint32_t getOrigin(uint32_t sector) const {
+            return sector - sector % aheadRange;
+        }
+
+    };
+
+    class Drive {
+        const uint32_t sectorSize = 512;
+
+        TCPsocket socket;
+        const uint8_t aheadRange;
+        uint8_t *readAheadBuffer;
+        uint32_t aheadSize;
+
+        BlockCache cache;
+
+    public:
+        Drive(TCPsocket socket, uint8_t aheadRange = 255, uint32_t memoryLimit = 32 * 1024 * 1024) :
+                socket(socket), aheadRange(aheadRange), cache(sectorSize, aheadRange, memoryLimit) {
+
+            aheadSize = sectorSize * aheadRange;
+            readAheadBuffer = new uint8_t[aheadSize];
+        }
+
+        ~Drive() {
+            SDLNet_TCP_Close(socket);
+            delete[] readAheadBuffer;
+        }
+
+        uint8_t read(uint32_t sector, uint8_t *buffer) {
+            auto cached = cache.read(sector);
+            if (cached) {
+                memcpy(buffer, cached, sectorSize);
+                return 0;
+            }
+
+            static const uint8_t readCommand = 1;
+            if (SDLNet_TCP_Send(socket, &readCommand, sizeof(uint8_t)) != sizeof(uint8_t)) {
+                return 2;
+            }
+            auto origin = cache.getOrigin(sector);
+            if (SDLNet_TCP_Send(socket, &origin, sizeof(uint32_t)) != sizeof(uint32_t)) {
+                return 3;
+            }
+            if (SDLNet_TCP_Send(socket, &aheadRange, sizeof(uint8_t)) != sizeof(uint8_t)) {
+                return 4;
+            }
+            if (SDLNet_TCP_Recv_All(socket, readAheadBuffer, sizeof(uint32_t)) != sizeof(uint32_t)) {
+                return 5;
+            }
+            uint32_t compressedSize = readAheadBuffer[0] + (readAheadBuffer[1] << 8) + (readAheadBuffer[2] << 16) + (readAheadBuffer[3] << 24);
+            if (SDLNet_TCP_Recv_All(socket, readAheadBuffer, compressedSize) != compressedSize) {
+                return 6;
+            }
+
+            int decodeResult = decode_lz4_block(compressedSize, aheadSize, (char *) readAheadBuffer);
+            if (decodeResult != aheadSize) {
+                return decodeResult;
+            }
+
+            cache.create(origin, readAheadBuffer);
+            memcpy(buffer, readAheadBuffer + (sector - origin) * sectorSize, sectorSize);
+
+            return 0;
+        }
+
+        uint8_t write(uint32_t sector, uint8_t *buffer) {
+            cache.write(sector, buffer);
+            static const uint8_t writeCommand = 2;
+            if (SDLNet_TCP_Send(socket, &writeCommand, sizeof(uint8_t)) != sizeof(uint8_t)) {
+                return 2;
+            }
+            if (SDLNet_TCP_Send(socket, &sector, sizeof(uint32_t)) != sizeof(uint32_t)) {
+                return 3;
+            }
+            if (SDLNet_TCP_Send(socket, buffer, sectorSize) != sectorSize) {
+                return 4;
+            }
+            return 0;
+        }
+    };
+
 }
 
-size_t sockdrive_open(const char* host, uint16_t port) {
+size_t sockdrive_open(const char *host, uint16_t port) {
     IPaddress address;
     if (SDLNet_ResolveHost(&address, host, port) == 0) {
-        return reinterpret_cast<size_t>(SDLNet_TCP_Open(&address));
+        return reinterpret_cast<size_t>(new Drive(SDLNet_TCP_Open(&address)));
     }
 
     return 0;
@@ -38,67 +173,19 @@ uint8_t sockdrive_read(size_t handle, uint32_t sector, uint8_t *buffer) {
         return 1;
     }
 
-    auto it = sectorCache.find(sector);
-    if (it != sectorCache.end()) {
-        memcpy(buffer, it->second, sectorSize);
-        return 0;
-    }
-
-
-    TCPsocket socket = getSocket(handle);
-    static const uint8_t readCommand = 1;
-    static const uint8_t ahead = aheadRead;
-    static uint8_t *aheadBuffer = new uint8_t[sectorSize * aheadRead];
-    if (SDLNet_TCP_Send(socket, &readCommand, sizeof(uint8_t)) != sizeof(uint8_t)) {
-        return 2;
-    }
-    if (SDLNet_TCP_Send(socket, &sector, sizeof(uint32_t)) != sizeof(uint32_t)) {
-        return 3;
-    }
-    if (SDLNet_TCP_Send(socket, &ahead, sizeof(uint8_t)) != sizeof(uint8_t)) {
-        return 4;
-    }
-    ;
-    if (SDLNet_TCP_Recv_All(socket, aheadBuffer, sectorSize * aheadRead) != sectorSize * aheadRead) {
-        return 5;
-    }
-
-    memcpy(buffer, aheadBuffer, sectorSize);
-    for (int i = 0; i < aheadRead; ++i) {
-        if (sectorCache.find(sector + i) == sectorCache.end()) {
-            uint8_t *copy = new uint8_t[sectorSize];
-            memcpy(copy, aheadBuffer + i * sectorSize, sectorSize);
-            sectorCache.insert(std::make_pair<>(sector + i, copy));
-        }
-    }
-    return 0;
+    return reinterpret_cast<Drive*>(handle)->read(sector, buffer);
 }
 
-uint8_t sockdrive_write(size_t handle, uint32_t sector, uint8_t* buffer) {
+uint8_t sockdrive_write(size_t handle, uint32_t sector, uint8_t *buffer) {
     if (!handle) {
         return 1;
     }
 
-    uint8_t *copy = new uint8_t[sectorSize];
-    memcpy(copy, buffer, sectorSize);
-    sectorCache[sector] = copy;
-
-    TCPsocket socket = getSocket(handle);
-    static const uint8_t writeCommand = 2;
-    if (SDLNet_TCP_Send(socket, &writeCommand, sizeof(uint8_t)) != sizeof(uint8_t)) {
-        return 2;
-    }
-    if (SDLNet_TCP_Send(socket, &sector, sizeof(uint32_t)) != sizeof(uint32_t)) {
-        return 3;
-    }
-    if (SDLNet_TCP_Send(socket, buffer, sectorSize) != sectorSize) {
-        return 4;
-    }
-    return 0;
+    return reinterpret_cast<Drive*>(handle)->write(sector, buffer);
 }
 
 void sockdrive_close(size_t handle) {
     if (handle) {
-        SDLNet_TCP_Close(getSocket(handle));
+        delete reinterpret_cast<Drive*>(handle);
     }
 }
