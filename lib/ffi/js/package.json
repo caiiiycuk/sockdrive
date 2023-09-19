@@ -1,0 +1,25 @@
+{
+  "name": "sockdrive-asyncify",
+  "version": "1.0.0",
+  "description": "The sockdrive support for emscripten",
+  "license": "GPLv3",
+  "private": true,
+  "dependencies": {
+    "buffer": "^6.0.3",
+    "fifolock": "^1.0.0",
+    "stream-browserify": "^3.0.0",
+    "struct-fu": "^1.2.1",
+    "typedarray-to-buffer": "^4.0.0",
+    "xok": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/chai": "^4.3.6",
+    "@types/mocha": "^10.0.1",
+    "eslint": "^8.48.0",
+    "eslint-webpack-plugin": "^4.0.1",
+    "ts-loader": "^9.4.4",
+    "typescript": "^5.2.2",
+    "webpack": "^5.88.2",
+    "webpack-cli": "^5.1.4"
+  }
+}

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>sockdrive js ffi tests</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="test/mocha.css" />
+  </head>
+  <body>
+    <div id="mocha"></div>
+
+    <script src="test/chai.js"></script>
+    <script src="test/mocha.js"></script>
+    <script class="mocha-init">
+      mocha.setup("qunit");
+      mocha.checkLeaks();
+    </script>
+    <script src="sockdrive.js"></script>
+    <script src="test.js"></script>
+    <script class="mocha-exec">
+      runTests().catch(console.error);
+    </script>
+  </body>
+</html>
