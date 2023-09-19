@@ -1,4 +1,8 @@
+import { createFileSystem } from "./fatfs";
+
 const toBuffer = require("typedarray-to-buffer");
+import { Drive } from "./sockdrive/drive";
+import { Stats as SockdriveStats } from "./sockdrive/types";
 
 export interface Driver {
     sectorSize: number,
@@ -32,6 +36,8 @@ export type CreateFileSystemApi = (driver: Driver, opts: {
     uid?: number,
     gid?: number,
 }, event: (event: "ready" | "error", reason: Error | null) => void) => FileSystemApi;
+export type CreateSockdriveFileSystem = typeof createSockdriveFileSystem;
+
 
 export class FileSystem {
     fs: FileSystemApi;
@@ -109,4 +115,82 @@ export interface StatsBase<T> {
     ctime: Date;
     birthtime: Date;
 }
+
 export interface Stats extends StatsBase<number> { }
+
+export async function createSockdriveFileSystem(url: string) {
+    const stats: SockdriveStats = {
+        read: 0,
+        write: 0,
+        readTotalTime: 0,
+        cacheHit: 0,
+        cacheMiss: 0,
+        cacheUsed: 0,
+    };
+
+    const sectorSize = 512;
+    const module = {
+        HEAPU8: new Uint8Array(sectorSize * 255 + sectorSize),
+    };
+
+    // TODO: drive should provide size and disk geometry
+    const drive = new Drive(url, stats, module, sectorSize, 255, sectorSize);
+    const imageSize = 2 * 1024 * 1024 * 1024; // 2GB //FIX!
+
+    // TODO: fatfs should respect boot record section
+    const MBR_OFFSET = 63;
+    const driver: Driver = {
+        sectorSize,
+        numSectors: imageSize / sectorSize,
+        readSectors: function(start, dst, cb) {
+            (async () => {
+                start += MBR_OFFSET;
+                // TODO we can avoid copying in dst.set
+                for (let i = 0; i < dst.length / sectorSize; ++i) {
+                    if (drive.read(start + i, 0, true) !== 0) {
+                        const readCode = await drive.read(start + i, 0, false);
+                        if (readCode !== 0) {
+                            cb(new Error("Read error, code: " + readCode), dst);
+                            return;
+                        }
+                    }
+                    dst.set(module.HEAPU8.slice(0, sectorSize), i * sectorSize);
+                }
+            })()
+                .then(() => cb(null, dst))
+                .catch((e) => cb(e, dst));
+        },
+        writeSectors: function(start, data, cb) {
+            start += MBR_OFFSET;
+            for (let i = 0; i < data.length / sectorSize; ++i) {
+                module.HEAPU8.set(data.slice(i * sectorSize, (i + 1) * sectorSize), 0);
+                const writeCode = drive.write(start + i, 0);
+                if (writeCode !== 0) {
+                    cb(new Error("Write error, code: " + 0));
+                    return;
+                }
+            }
+            cb(null);
+        },
+    };
+
+    const fs = await new Promise<FileSystemApi>((resolve, reject) => {
+        const fs = (createFileSystem as any as CreateFileSystemApi)(driver, {}, (ev, reason) => {
+            if (ev === "ready") {
+                resolve(fs);
+            } else {
+                console.error(ev, reason);
+                reject(reason);
+            }
+        });
+    });
+
+    return {
+        fs: new FileSystem(fs),
+        close: () => drive.close(),
+    };
+}
+
+
+(window as any).createSockdriveFileSystem = createSockdriveFileSystem;
+(window as any).createFileSystem = createFileSystem;

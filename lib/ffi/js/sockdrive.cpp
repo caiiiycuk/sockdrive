@@ -8,7 +8,7 @@
 #include "../lz4/lz4.h"
 
 const char *jsImpl = 
-#include "dist/bundle.js"
+#include "dist/sockdriveNative.js"
 ;
 
 EM_JS(size_t, em_sockdrive_open, (const char* host, uint16_t port, const char* jsImpl), {

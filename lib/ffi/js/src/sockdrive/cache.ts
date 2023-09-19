@@ -49,11 +49,9 @@ export class BlockCache implements Cache {
     public memUsed() {
         return this.lru.size * this.aheadRange * this.sectorSize;
     }
-
 }
 
 export class SimpleCache implements Cache {
-
     aheadRange: number;
     sectorSize: number;
     lru: LRUMap;
@@ -82,7 +80,7 @@ export class SimpleCache implements Cache {
             this.lru.set(sector + i, buffer.slice(i * this.sectorSize, (i + 1) * this.sectorSize));
         }
     }
-    
+
     public getOrigin(sector: number) {
         return sector;
     }
@@ -93,7 +91,6 @@ export class SimpleCache implements Cache {
 }
 
 export class BlockAndWriteCache implements Cache {
-
     aheadRange: number;
     sectorSize: number;
     blockCache: BlockCache;
@@ -125,7 +122,7 @@ export class BlockAndWriteCache implements Cache {
             }
         }
     }
-    
+
     getOrigin(sector: number): number {
         return this.blockCache.getOrigin(sector);
     }

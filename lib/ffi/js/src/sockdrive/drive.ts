@@ -1,12 +1,11 @@
 import { Ptr, Stats } from "./types";
 import { BlockCache, Cache } from "./cache";
 
-declare const Module: {
-    HEAPU8: Uint8Array,
-    _malloc: (len: number) => Ptr,
-    _free: (ptr: Ptr) => void,
-    _decode_lz4_block: (compressedSize: number, decodedSize: number, ptr: Ptr) => number,
-};
+interface Module {
+    HEAPU8: Uint8Array;
+    _decode_lz4_block?: (compressedSize: number,
+        decodedSize: number, ptr: Ptr) => number;
+}
 
 interface Request {
     type: 1 | 2, // read | write
@@ -16,8 +15,8 @@ interface Request {
 }
 
 export class Drive {
-
-    sectorSize = 512;
+    module: Module;
+    sectorSize: number;
     url: string;
     stats: Stats;
 
@@ -33,18 +32,29 @@ export class Drive {
     readAheadPos = 0;
     readAheadCompressed = 0;
     readStartedAt: number;
+    decodeBuffer: Uint8Array;
 
     cache: Cache;
+    cleanup = () => {/**/};
 
-    public constructor(url: string, stats: Stats, aheadRange = 255, memoryLimit = 32 * 1024 * 1024) {
+    public constructor(url: string, stats: Stats,
+        module: Module, readAheadBuffer: Ptr, aheadRange: number,
+        sectorSize = 512, memoryLimit = 32 * 1024 * 1024) {
+        if (aheadRange > 255) {
+            throw new Error("Maximum aheadRange is 255");
+        }
+
+        this.sectorSize = sectorSize;
+        this.module = module;
         this.url = url;
         this.request = null;
         this.readBuffer = new Uint8Array(1 + 4 + 1);
         this.writeBuffer = new Uint8Array(1 + 4 + this.sectorSize);
-        this.readAheadBuffer = Module._malloc(this.sectorSize * aheadRange);
+        this.readAheadBuffer = readAheadBuffer;
         this.stats = stats;
         this.aheadRange = aheadRange;
         this.aheadSize = aheadRange * this.sectorSize;
+        this.decodeBuffer = new Uint8Array(this.aheadSize);
         this.cache = new BlockCache(this.sectorSize, aheadRange, memoryLimit);
 
         this.reconnect();
@@ -60,15 +70,19 @@ export class Drive {
             };
             const onError = (e: Event) => {
                 console.error("Network error", e, "will reconnect");
-                socket.removeEventListener("message", onMessage)
-                socket.removeEventListener("open", onOpen);
-                socket.removeEventListener("error", onError);
+                cleanup();
                 socket.close();
                 setTimeout(this.reconnect.bind(this), 300);
             };
             socket.addEventListener("message", onMessage);
             socket.addEventListener("error", onError);
             socket.addEventListener("open", onOpen);
+            const cleanup = function() {
+                socket.removeEventListener("message", onMessage);
+                socket.removeEventListener("open", onOpen);
+                socket.removeEventListener("error", onError);
+            };
+            this.cleanup = cleanup;
         });
 
         if (this.request !== null) {
@@ -88,7 +102,7 @@ export class Drive {
                 this.stats.cacheHit++;
             }
             this.request = null;
-            Module.HEAPU8.set(cached, buffer);
+            this.module.HEAPU8.set(cached, buffer);
             return sync ? 0 : Promise.resolve(0);
         } else if (sync) {
             return 255;
@@ -111,8 +125,8 @@ export class Drive {
         this.request = {
             type: 2,
             sector,
-            buffer: Module.HEAPU8.slice(buffer, buffer + this.sectorSize),
-            resolve: () => { /**/ },
+            buffer: this.module.HEAPU8.slice(buffer, buffer + this.sectorSize),
+            resolve: () => {/**/},
         };
         this.cache.write(sector, this.request.buffer as Uint8Array);
         this.executeRequest(this.request);
@@ -122,10 +136,12 @@ export class Drive {
 
     public close() {
         this.socket
-            .then((s) => s.close())
+            .then((s) => {
+                this.cleanup();
+                s.close();
+            })
             .catch((e) => console.error("Can't close socket", e))
             .finally(() => {
-                Module._free(this.readAheadBuffer);
                 this.readAheadBuffer = 0;
             });
     }
@@ -182,21 +198,38 @@ export class Drive {
                 console.error("wrong read payload length " + data.byteLength + " instead of " + restLength);
                 resolve(3);
             } else {
-                Module.HEAPU8.set(data, this.readAheadBuffer + this.readAheadPos);
+                this.module.HEAPU8.set(data, this.readAheadBuffer + this.readAheadPos);
                 this.readAheadPos += data.byteLength;
 
                 if (this.readAheadPos == this.readAheadCompressed) {
-                    const decodeResult = Module._decode_lz4_block(this.readAheadCompressed, this.aheadSize, this.readAheadBuffer);
+                    let decodeResult = this.aheadSize;
+                    if (this.readAheadCompressed != this.aheadSize) {
+                        if (this.module._decode_lz4_block !== undefined) {
+                            decodeResult = this.module._decode_lz4_block(
+                                this.readAheadCompressed, this.aheadSize, this.readAheadBuffer);
+                        } else {
+                            const result = decodeLz4(this.module.HEAPU8.slice(this.readAheadBuffer,
+                                this.readAheadBuffer + this.aheadSize), this.decodeBuffer, 0, 0);
+                            if (result < 0) {
+                                decodeResult = result;
+                            } else {
+                                this.module.HEAPU8.set(this.decodeBuffer, this.readAheadBuffer);
+                            }
+                        }
+                    }
+
                     if (decodeResult != this.aheadSize) {
-                        console.error("wrong decode result " + decodeResult);
+                        console.error("wrong decode result " + decodeResult + " should be " + this.aheadSize);
                         resolve(4);
                     } else {
                         const origin = this.cache.getOrigin(sector);
-                        this.cache.create(origin, Module.HEAPU8.slice(this.readAheadBuffer, this.readAheadBuffer + this.aheadSize));
+                        this.cache.create(origin,
+                            this.module.HEAPU8.slice(this.readAheadBuffer, this.readAheadBuffer + this.aheadSize));
                         this.stats.cacheUsed = this.cache.memUsed();
                         const offset = sector - origin;
-                        Module.HEAPU8.set(
-                            Module.HEAPU8.slice(this.readAheadBuffer + offset * this.sectorSize, this.readAheadBuffer + (offset + 1) * this.sectorSize),
+                        this.module.HEAPU8.set(
+                            this.module.HEAPU8.slice(this.readAheadBuffer + offset * this.sectorSize,
+                                this.readAheadBuffer + (offset + 1) * this.sectorSize),
                             buffer as number);
                         this.stats.read += this.readAheadCompressed;
                         this.stats.readTotalTime += Date.now() - this.readStartedAt;
@@ -210,5 +243,68 @@ export class Drive {
             this.reconnect();
         }
     }
-
 }
+
+/**
+ * Decode a block. Assumptions: input contains all sequences of a
+ * chunk, output is large enough to receive the decoded data.
+ * If the output buffer is too small, an error will be thrown.
+ * If the returned value is negative, an error occured at the returned offset.
+ *
+ * @param {ArrayBufferView} input input data
+ * @param {ArrayBufferView} output output data
+ * @param {number=} sIdx
+ * @param {number=} eIdx
+ * @return {number} number of decoded bytes
+ * @private
+ */
+function decodeLz4(input: Uint8Array, output: Uint8Array, sIdx: number, eIdx: number) {
+    sIdx = sIdx || 0;
+    eIdx = eIdx || (input.length - sIdx);
+    // Process each sequence in the incoming data
+    let i; let n; let j;
+    for (i = sIdx, n = eIdx, j = 0; i < n;) {
+        const token = input[i++];
+
+        // Literals
+        let literalsLength = (token >> 4);
+        if (literalsLength > 0) {
+            // length of literals
+            let l = literalsLength + 240;
+            while (l === 255) {
+                l = input[i++];
+                literalsLength += l;
+            }
+
+            // Copy the literals
+            const end = i + literalsLength;
+            while (i < end) output[j++] = input[i++];
+
+            // End of buffer?
+            if (i === n) return j;
+        }
+
+        // Match copy
+        // 2 bytes offset (little endian)
+        const offset = input[i++] | (input[i++] << 8);
+
+        // XXX 0 is an invalid offset value
+        if (offset === 0) return j;
+        if (offset > j) return -(i-2);
+
+        // length of match copy
+        let matchLength = (token & 0xf);
+        let l = matchLength + 240;
+        while (l === 255) {
+            l = input[i++];
+            matchLength += l;
+        }
+
+        // Copy the match
+        let pos = j - offset; // position of the match copy in the current output
+        const end = j + matchLength + 4; // minmatch = 4
+        while (j < end) output[j++] = output[pos++];
+    }
+
+    return j;
+};

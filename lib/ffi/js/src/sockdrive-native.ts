@@ -1,9 +1,17 @@
-import { Handle, Ptr, Stats } from "./types";
-import { Drive } from "./drive";
+import { Handle, Ptr, Stats } from "./sockdrive/types";
+import { Drive } from "./sockdrive/drive";
 
-declare const Module: any;
+interface EmModule {
+    HEAPU8: Uint8Array,
+    _malloc: (len: number) => Ptr,
+    _free: (ptr: Ptr) => void,
+    _decode_lz4_block?: (compressedSize: number,
+        decodedSize: number, ptr: Ptr) => number;
+};
 
-(function () {
+declare const Module: EmModule & any;
+
+(function() {
     let seq = 0;
     const mapping: { [handle: Handle]: Drive } = {};
     const stats: Stats = {
@@ -18,7 +26,8 @@ declare const Module: any;
         stats,
         open: (host: string, port: number): Handle => {
             seq++;
-            mapping[seq] = new Drive("ws://" + host + ":" + port, stats);
+            mapping[seq] = new Drive("ws://" + host + ":" + port, stats, Module,
+                Module._malloc(512 * 255), 255, 512);
             return seq;
         },
 
@@ -32,7 +41,7 @@ declare const Module: any;
         },
 
         write: (handle: Handle, sector: number, buffer: Ptr): number => {
-            if  (mapping[handle]) {
+            if (mapping[handle]) {
                 return mapping[handle].write(sector, buffer);
             }
             console.error("ERROR! sockdrive handle", handle, "not found");
@@ -41,6 +50,7 @@ declare const Module: any;
 
         close: (handle: Handle) => {
             if (mapping[handle]) {
+                Module._free(mapping[handle].readAheadBuffer);
                 mapping[handle].close();
                 delete mapping[handle];
             }

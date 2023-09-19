@@ -1,6 +1,7 @@
-import { FileSystem, FileSystemApi, CreateFileSystemApi, Driver } from "../fatfs";
+import { FileSystem, FileSystemApi, CreateFileSystemApi, Driver, CreateSockdriveFileSystem } from "../sockdrive-fat";
 
 declare const createFileSystem: CreateFileSystemApi;
+declare const createSockdriveFileSystem: CreateSockdriveFileSystem;
 
 const baseDir = "/fat_test-" + Math.random().toFixed(20).slice(2);
 const file = baseDir + "/Simple File.txt";
@@ -106,6 +107,27 @@ async function runTests() {
             await fs.close(fd);
         });
     }
+
+    suite("sockdrive 127.0.0.1:8001");
+
+    const testSd = (name: string, fn: (fs: FileSystem) => Promise<void>) => {
+        test(name, async () => {
+            const { fs, close } = await createSockdriveFileSystem("ws://127.0.0.1:8001");
+            await fn(fs);
+            close();
+        });
+    };
+
+    testSd("connect", async (fs) => {
+        assert.ok(fs);
+    });
+
+    testSd("readdir /", async (fs) => {
+        const files = await fs.readdir("/");
+        assert.ok(Array.isArray(files));
+        assert.ok(files.length > 0);
+        console.log(files);
+    });
 
     mocha.run();
 }
