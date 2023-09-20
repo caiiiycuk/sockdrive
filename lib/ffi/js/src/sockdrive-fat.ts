@@ -51,7 +51,6 @@ export class FileSystem {
                 if (!err) {
                     resolve(res);
                 } else {
-                    console.log(err);
                     reject(err);
                 }
             });
@@ -186,6 +185,7 @@ export async function createSockdriveFileSystem(url: string) {
     });
 
     return {
+        stats,
         fs: new FileSystem(fs),
         close: () => drive.close(),
     };
