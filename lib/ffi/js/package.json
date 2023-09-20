@@ -15,8 +15,12 @@
   "devDependencies": {
     "@types/chai": "^4.3.6",
     "@types/mocha": "^10.0.1",
+    "@typescript-eslint/eslint-plugin": "^6.7.2",
+    "@typescript-eslint/parser": "^6.7.2",
     "eslint": "^8.48.0",
+    "eslint-config-google": "^0.14.0",
     "eslint-webpack-plugin": "^4.0.1",
+    "process": "^0.11.10",
     "ts-loader": "^9.4.4",
     "typescript": "^5.2.2",
     "webpack": "^5.88.2",
