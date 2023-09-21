@@ -63,15 +63,15 @@ export class FileSystem {
     readdir(path: string) {
         return this.promisify<string[]>(this.fs.readdir, path);
     }
-    open(path: string, flags: string | number, mode: number) {
+    fopen(path: string, flags: string | number, mode: number) {
         return this.promisify<FileDescriptor>(this.fs.open, path, flags, mode);
     }
-    read(fd: FileDescriptor, buf: Uint8Array, offset: number,
+    fread(fd: FileDescriptor, buf: Uint8Array, offset: number,
         length: number, pos: number | null) {
         return this.promisify<number>(this.fs.read, fd, toBuffer(buf),
             offset, length, pos);
     }
-    write(fd: FileDescriptor, buf: Uint8Array, offset: number,
+    fwrite(fd: FileDescriptor, buf: Uint8Array, offset: number,
         length: number, pos: number | null) {
         return this.promisify<number>(this.fs.write, fd, toBuffer(buf),
             offset, length, pos);
@@ -79,11 +79,35 @@ export class FileSystem {
     fstat(fd: FileDescriptor) {
         return this.promisify<Stats>(this.fs.fstat, fd);
     }
-    exists(fd: FileDescriptor) {
-        return this.fstat(fd).then(() => true).catch(() => false);
-    }
-    close(fd: FileDescriptor) {
+    fclose(fd: FileDescriptor) {
         return this.promisify<void>(this.fs.close, fd);
+    }
+
+    // helpers
+    async stat(path: string) {
+        const fd: number | null = await (this.fopen(path, "\\r", 0o666)
+            .catch((e: Error & { code: string }) => {
+                if (e.code === "NOENT") {
+                    return null;
+                }
+
+                throw e;
+            }));
+        if (fd === null) {
+            return null;
+        }
+        const stat = await this.fstat(fd);
+        await this.fclose(fd);
+        return stat;
+    }
+
+    async isdir(path: string) {
+        const stat = await this.stat(path);
+        return stat !== null ? stat.isDirectory() : false;
+    }
+
+    async exists(path: string) {
+        return (await this.stat(path)) !== null;
     }
 }
 

@@ -134,16 +134,22 @@ export class Drive {
         return 0;
     }
 
-    public close() {
-        this.socket
-            .then((s) => {
-                this.cleanup();
-                s.close();
-            })
-            .catch((e) => console.error("Can't close socket", e))
-            .finally(() => {
-                this.readAheadBuffer = 0;
+    public async close() {
+        try {
+            const socket = await this.socket;
+            await new Promise<void>((resolve) => {
+                const intervalId = setInterval(() => {
+                    if (socket.bufferedAmount === 0) {
+                        clearInterval(intervalId);
+                        resolve();
+                    }
+                }, 32);
             });
+            this.cleanup();
+            socket.close();
+        } finally {
+            this.readAheadBuffer = 0;
+        }
     }
 
     private executeRequest(request: Request) {
@@ -290,7 +296,7 @@ function decodeLz4(input: Uint8Array, output: Uint8Array, sIdx: number, eIdx: nu
 
         // XXX 0 is an invalid offset value
         if (offset === 0) return j;
-        if (offset > j) return -(i-2);
+        if (offset > j) return -(i - 2);
 
         // length of match copy
         let matchLength = (token & 0xf);

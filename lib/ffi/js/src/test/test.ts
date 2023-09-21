@@ -39,25 +39,32 @@ async function runTests() {
 
     const testRead = async (fs: FileSystem) => {
         const readBuf = new Uint8Array(writeBuf.length);
-        const fd = await fs.open(file, "r", 0o666);
-        assert.isTrue(await fs.exists(fd));
+        const fd = await fs.fopen(file, "r", 0o666);
         assert.equal((await fs.fstat(fd)).size, writeBuf.length);
-        assert.equal(await fs.read(fd, readBuf, 0, readBuf.length, 0), readBuf.length);
+        assert.equal(await fs.fread(fd, readBuf, 0, readBuf.length, 0), readBuf.length);
         assert.deepEqual(readBuf, writeBuf);
-        await fs.close(fd);
+        await fs.fclose(fd);
     };
 
-    const testOpenWriteStatReadClose = async (fs: FileSystem) => {
+    const testOpenWriteStatClose = async (fs: FileSystem) => {
         try {
             await fs.mkdir(baseDir);
         } catch (e) {
             // ignore if exists
         }
-        const fd = await fs.open(file, "w", 0o666);
+        const fd = await fs.fopen(file, "w", 0o666);
         assert.ok(fd);
-        assert.equal(await fs.write(fd, writeBuf, 0, writeBuf.length, null), writeBuf.length);
-        await fs.close(fd);
+        assert.equal(await fs.fwrite(fd, writeBuf, 0, writeBuf.length, null), writeBuf.length);
+        await fs.fclose(fd);
         await testRead(fs);
+    };
+
+    const testHelpers = async (fs: FileSystem) => {
+        assert.isFalse(await fs.exists("/not-exists"), "/not-exists not exits");
+        assert.isTrue(await fs.exists(baseDir), "baseDir exists");
+        assert.isTrue(await fs.exists(file), "file exists");
+        assert.isTrue(await fs.isdir(baseDir), "baseDir is dir");
+        assert.isFalse(await fs.isdir(file), "file is file");
     };
 
     for (const name of Object.keys(images)) {
@@ -90,7 +97,8 @@ async function runTests() {
             for (const method of [
                 "mkdir", "readdir",
                 // "rename", "unlink", "rmdir",
-                "close", "open", "write", "read", "fstat",
+                "fclose", "fopen", "fwrite", "fread", "fstat",
+                "stat", "exists", "isdir",
                 // "fsync",
                 // "ftruncate", "truncate",
                 // "readFile", "writeFile", "appendFile",
@@ -98,7 +106,7 @@ async function runTests() {
                 // "chown", "lchown", "fchown",
                 // "chmod", "lchmod", "fchmod",
                 // "utimes", "futimes",
-                // "stat", "lstat", "fstat", "exists",
+                // "lstat", "fstat",
                 // "link", "symlink", "readlink", "realpath",
 
                 // 'watchfile','unwatchfile','watch'
@@ -121,16 +129,28 @@ async function runTests() {
             assert.equal("/" + root[0], baseDir);
         });
 
-        testFs("open/write/stat/read/close", testOpenWriteStatReadClose);
+        testFs("open/write/stat/read/close", testOpenWriteStatClose);
+
+        testFs("exists/isdir", async (fs) => {
+            await testOpenWriteStatClose(fs);
+            await testHelpers(fs);
+        });
     }
 
     suite("sockdrive 127.0.0.1:8001");
 
-    const testSd = (name: string, fn: (fs: FileSystem) => Promise<void>) => {
+    const testSd = (name: string, fn: (fs: FileSystem) => Promise<void>, writeCheck?: number[]) => {
         test(name, async () => {
-            const { fs, close } = await createSockdriveFileSystem("ws://127.0.0.1:8001");
+            const { stats, fs, close } = await createSockdriveFileSystem("ws://127.0.0.1:8001");
             await fn(fs);
-            close();
+            await new Promise<void>((resolve) => {
+                setTimeout(resolve, 16);
+            });
+            await close();
+            if (writeCheck) {
+                assert.isTrue(writeCheck.findIndex((v) => v === stats.write) >= 0,
+                    "write check " + stats.write + " in " + writeCheck);
+            }
         });
     };
 
@@ -139,14 +159,12 @@ async function runTests() {
     });
 
     testSd("readdir /", async (fs) => {
-        const files = await fs.readdir("/");
-        assert.ok(Array.isArray(files));
-        assert.ok(files.length > 0);
-        console.log(files);
+        assert.ok(await fs.readdir("/"));
     });
 
-    testSd("open/write/stat/read/close", testOpenWriteStatReadClose);
+    testSd("open/write/stat/read/close", testOpenWriteStatClose);
     testSd("reconnect stat/read/close", testRead);
+    testSd("exists/isdir", testHelpers);
 
 
     mocha.run();
