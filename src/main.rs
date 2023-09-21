@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 mod layer;
 use layer::{Layer, SECTOR_SIZE};
+use layer::disk_layer::DiskLayer;
 
 #[tokio::main(worker_threads = 1)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -35,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .expect("Error setting Ctrl-C handler");
 
-    let mut layer = Layer::new("drive-0", 2048 / SECTOR_SIZE * 1024 * 1024);
+    let mut layer = DiskLayer::new("drive-0", 2048 / SECTOR_SIZE * 1024 * 1024);
     let listener = TcpListener::bind("0.0.0.0:8002").await?;
 
     println!("sockdrive is started");
