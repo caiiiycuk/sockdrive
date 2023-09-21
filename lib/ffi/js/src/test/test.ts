@@ -3,7 +3,7 @@ import { FileSystem, FileSystemApi, CreateFileSystemApi, Driver, CreateSockdrive
 declare const createFileSystem: CreateFileSystemApi;
 declare const createSockdriveFileSystem: CreateSockdriveFileSystem;
 
-const baseDir = "/fat_test-" + Math.random().toFixed(20).slice(2);
+const baseDir = "/test";
 const file = baseDir + "/Simple File.txt";
 
 async function runTests() {
@@ -30,6 +30,34 @@ async function runTests() {
         fat12: await loadImage("test/fat12.img"),
         fat16: await loadImage("test/fat16.img"),
         fat32: await loadImage("test/fat32.img"),
+    };
+
+    const writeBuf = new Uint8Array(4096 * 4);
+    for (let i = 0; i < writeBuf.length; ++i) {
+        writeBuf[i] = i % 256;
+    }
+
+    const testRead = async (fs: FileSystem) => {
+        const readBuf = new Uint8Array(writeBuf.length);
+        const fd = await fs.open(file, "r", 0o666);
+        assert.isTrue(await fs.exists(fd));
+        assert.equal((await fs.fstat(fd)).size, writeBuf.length);
+        assert.equal(await fs.read(fd, readBuf, 0, readBuf.length, 0), readBuf.length);
+        assert.deepEqual(readBuf, writeBuf);
+        await fs.close(fd);
+    };
+
+    const testOpenWriteStatReadClose = async (fs: FileSystem) => {
+        try {
+            await fs.mkdir(baseDir);
+        } catch (e) {
+            // ignore if exists
+        }
+        const fd = await fs.open(file, "w", 0o666);
+        assert.ok(fd);
+        assert.equal(await fs.write(fd, writeBuf, 0, writeBuf.length, null), writeBuf.length);
+        await fs.close(fd);
+        await testRead(fs);
     };
 
     for (const name of Object.keys(images)) {
@@ -93,19 +121,7 @@ async function runTests() {
             assert.equal("/" + root[0], baseDir);
         });
 
-        testFs("open/write/stat/read/close", async (fs) => {
-            await fs.mkdir(baseDir);
-            const fd = await fs.open(file, "w+", 0o666);
-            assert.ok(fd);
-            const writeBuf = new Uint8Array([0, 1, 2, 3, 4, 5, 6]);
-            const readBuf = new Uint8Array(writeBuf.length);
-            assert.equal(await fs.write(fd, writeBuf, 0, writeBuf.length, null), writeBuf.length);
-            assert.isTrue(await fs.exists(fd));
-            assert.equal((await fs.fstat(fd)).size, writeBuf.length);
-            assert.equal(await fs.read(fd, readBuf, 0, readBuf.length, 0), readBuf.length);
-            assert.deepEqual(readBuf, writeBuf);
-            await fs.close(fd);
-        });
+        testFs("open/write/stat/read/close", testOpenWriteStatReadClose);
     }
 
     suite("sockdrive 127.0.0.1:8001");
@@ -128,6 +144,10 @@ async function runTests() {
         assert.ok(files.length > 0);
         console.log(files);
     });
+
+    testSd("open/write/stat/read/close", testOpenWriteStatReadClose);
+    testSd("reconnect stat/read/close", testRead);
+
 
     mocha.run();
 }
