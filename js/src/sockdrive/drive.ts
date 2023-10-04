@@ -17,7 +17,10 @@ interface Request {
 export class Drive {
     module: Module;
     sectorSize: number;
-    url: string;
+    endpoint: string;
+    owner: string;
+    drive: string;
+    token: string;
     stats: Stats;
 
     socket: Promise<WebSocket>;
@@ -37,16 +40,30 @@ export class Drive {
     cache: Cache;
     cleanup = () => {/**/};
 
-    public constructor(url: string, stats: Stats,
-        module: Module, readAheadBuffer: Ptr, aheadRange: number,
-        sectorSize = 512, memoryLimit = 32 * 1024 * 1024) {
+    errorFn = (e: Error) => {/**/};
+
+    retries: number;
+
+    public constructor(endpoint: string,
+        owner: string,
+        drive: string,
+        token: string,
+        stats: Stats,
+        module: Module,
+        readAheadBuffer: Ptr,
+        aheadRange: number,
+        sectorSize = 512,
+        memoryLimit = 32 * 1024 * 1024) {
         if (aheadRange > 255) {
             throw new Error("Maximum aheadRange is 255");
         }
 
         this.sectorSize = sectorSize;
         this.module = module;
-        this.url = url;
+        this.endpoint = endpoint;
+        this.owner = owner;
+        this.drive = drive;
+        this.token = token;
         this.request = null;
         this.readBuffer = new Uint8Array(1 + 4 + 1);
         this.writeBuffer = new Uint8Array(1 + 4 + this.sectorSize);
@@ -57,24 +74,48 @@ export class Drive {
         this.decodeBuffer = new Uint8Array(this.aheadSize);
         this.cache = new BlockCache(this.sectorSize, aheadRange, memoryLimit);
 
+        this.retries = 3;
+
         this.reconnect();
     }
 
+    public onError(errorFn: (e: Error) => void) {
+        this.errorFn = errorFn;
+    }
+
     public reconnect(): void {
-        this.socket = new Promise<WebSocket>((resolve) => {
-            const socket = new WebSocket(this.url);
+        this.socket = new Promise<WebSocket>((resolve, reject) => {
+            const socket = new WebSocket(this.endpoint);
             socket.binaryType = "arraybuffer";
             const onMessage = this.onMessage.bind(this);
             const onOpen = () => {
-                resolve(socket);
+                const onInit = (event: { data: string }) => {
+                    socket.removeEventListener("message", onInit);
+                    if (event.data === "Ok") {
+                        socket.addEventListener("message", onMessage);
+                        resolve(socket);
+                    } else {
+                        const error = new Error("Unable to establish connection");
+                        this.errorFn(error);
+                        reject(error);
+                    }
+                };
+                socket.addEventListener("message", onInit);
+                socket.send(this.owner + "&" + this.drive + "&" + this.token);
             };
             const onError = (e: Event) => {
                 console.error("Network error", e, "will reconnect");
                 cleanup();
                 socket.close();
-                setTimeout(this.reconnect.bind(this), 300);
+                this.retries--;
+                if (this.retries === 0) {
+                    const error = new Error("Network problem");
+                    this.errorFn(error);
+                    reject(error);
+                } else {
+                    setTimeout(this.reconnect.bind(this), 300);
+                }
             };
-            socket.addEventListener("message", onMessage);
             socket.addEventListener("error", onError);
             socket.addEventListener("open", onOpen);
             const cleanup = function() {

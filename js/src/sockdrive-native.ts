@@ -24,9 +24,9 @@ declare const Module: EmModule & any;
     };
     Module.sockdrive = {
         stats,
-        open: (host: string, port: number): Handle => {
+        open: (host: string, port: number, owner: string, drive: string, token: string): Handle => {
             seq++;
-            mapping[seq] = new Drive("ws://" + host + ":" + port, stats, Module,
+            mapping[seq] = new Drive("ws://" + host + ":" + port, owner, drive, token, stats, Module,
                 Module._malloc(512 * 255), 255, 512);
             return seq;
         },

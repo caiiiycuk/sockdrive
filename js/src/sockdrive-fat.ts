@@ -141,7 +141,11 @@ export interface StatsBase<T> {
 
 export interface Stats extends StatsBase<number> { }
 
-export async function createSockdriveFileSystem(url: string) {
+export async function createSockdriveFileSystem(endpoint: string,
+                                                ownerId: string,
+                                                driveId: string,
+                                                token: string,
+                                                onError: (e: Error) => void = () => {}) {
     const stats: SockdriveStats = {
         read: 0,
         write: 0,
@@ -157,7 +161,9 @@ export async function createSockdriveFileSystem(url: string) {
     };
 
     // TODO: drive should provide size and disk geometry
-    const drive = new Drive(url, stats, module, sectorSize, 255, sectorSize);
+    const drive = new Drive(endpoint, ownerId, driveId, token,
+        stats, module, sectorSize, 255, sectorSize);
+    drive.onError(onError);
     const imageSize = 2 * 1024 * 1024 * 1024; // 2GB //FIX!
 
     // TODO: fatfs should respect boot record section
