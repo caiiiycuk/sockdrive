@@ -40,6 +40,7 @@ export class Drive {
     cache: Cache;
     cleanup = () => {/**/};
 
+    openFn = (read: boolean, write: boolean) => {/**/};
     errorFn = (e: Error) => {/**/};
 
     retries: number;
@@ -83,6 +84,11 @@ export class Drive {
         this.errorFn = errorFn;
     }
 
+    public onOpen(openFn: (read: boolean, write: boolean) => void) {
+        this.openFn = openFn;
+    }
+
+
     public reconnect(): void {
         this.socket = new Promise<WebSocket>((resolve, reject) => {
             const socket = new WebSocket(this.endpoint);
@@ -91,11 +97,12 @@ export class Drive {
             const onOpen = () => {
                 const onInit = (event: { data: string }) => {
                     socket.removeEventListener("message", onInit);
-                    if (event.data === "Ok") {
+                    if (event.data === "write" || event.data === "read") {
                         socket.addEventListener("message", onMessage);
+                        this.openFn(true, event.data === "write");
                         resolve(socket);
                     } else {
-                        const error = new Error("Unable to establish connection");
+                        const error = new Error(event.data ?? "Unable to establish connection");
                         this.errorFn(error);
                         reject(error);
                     }

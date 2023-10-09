@@ -11,6 +11,8 @@ yarn run webpack
 
 You can test by opening dist/test.html, but run dist/test/make-img-linux.sh first.
 
+Types information can be found in src/sockdrive-fat.d.ts
+
 # 3rdparty code
 
 ## LZ4

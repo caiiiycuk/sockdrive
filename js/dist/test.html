@@ -13,6 +13,7 @@
     <script src="test/mocha.js"></script>
     <script class="mocha-init">
       mocha.setup("qunit");
+      mocha.timeout(5000);
       mocha.checkLeaks();
     </script>
     <script src="sockdriveFat.js"></script>

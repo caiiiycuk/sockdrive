@@ -140,15 +140,21 @@ async function runTests() {
     suite("sockdrive 127.0.0.1:8001");
 
     test("error on wrong drive name", (done) => {
-        createSockdriveFileSystem("ws://127.0.0.1:8001", "system", "not-exists", "", (e) => {
-            assert.strictEqual(e.message, "Unable to establish connection");
-            done();
-        });
+        createSockdriveFileSystem("ws://127.0.0.1:8001", "system", "not-exists", "",
+            () => { },
+            (e) => {
+                assert.strictEqual(e.message, "Err: no such drive");
+                done();
+            });
     });
 
     const testSd = (name: string, fn: (fs: FileSystem) => Promise<void>, writeCheck?: number[]) => {
         test(name, async () => {
-            const { stats, fs, close } = await createSockdriveFileSystem("ws://127.0.0.1:8001", "system", "test", "");
+            const { stats, fs, close } = await createSockdriveFileSystem("ws://127.0.0.1:8001", "system", "test", "",
+                (read, write) => {
+                    assert.isTrue(read);
+                    assert.isTrue(write);
+                });
             await fn(fs);
             await new Promise<void>((resolve) => {
                 setTimeout(resolve, 16);

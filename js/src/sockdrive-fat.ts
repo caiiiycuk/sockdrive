@@ -145,6 +145,7 @@ export async function createSockdriveFileSystem(endpoint: string,
                                                 ownerId: string,
                                                 driveId: string,
                                                 token: string,
+                                                onOpen: (read: boolean, write: boolean) => void = () => {},
                                                 onError: (e: Error) => void = () => {}) {
     const stats: SockdriveStats = {
         read: 0,
@@ -163,6 +164,7 @@ export async function createSockdriveFileSystem(endpoint: string,
     // TODO: drive should provide size and disk geometry
     const drive = new Drive(endpoint, ownerId, driveId, token,
         stats, module, sectorSize, 255, sectorSize);
+    drive.onOpen(onOpen);
     drive.onError(onError);
     const imageSize = 2 * 1024 * 1024 * 1024; // 2GB //FIX!
 
