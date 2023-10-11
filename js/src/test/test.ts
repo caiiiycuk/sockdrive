@@ -152,8 +152,8 @@ async function runTests() {
         test(name, async () => {
             const { stats, fs, close } = await createSockdriveFileSystem("ws://127.0.0.1:8001", "system", "test", "",
                 (read, write) => {
-                    assert.isTrue(read);
-                    assert.isTrue(write);
+                    assert.isTrue(read, "read access");
+                    assert.isTrue(write, "write access");
                 });
             await fn(fs);
             await new Promise<void>((resolve) => {

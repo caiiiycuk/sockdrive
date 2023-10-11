@@ -3,7 +3,7 @@
 #include <unordered_map>
 #include "LRUCache11.hpp"
 
-#include "../sockdrive.h"
+#include "../include/sockdrive.h"
 #include "../lz4/lz4.h"
 #include "SDL_net.h"
 
@@ -159,9 +159,9 @@ namespace {
 
 }
 
-size_t sockdrive_open(const char *host, uint16_t port) {
+size_t sockdrive_open(const char* url, const char* owner, const char* name, const char* token) {
     IPaddress address;
-    if (SDLNet_ResolveHost(&address, host, port) == 0) {
+    if (SDLNet_ResolveHost(&address, url, 8001) == 0) {
         return reinterpret_cast<size_t>(new Drive(SDLNet_TCP_Open(&address)));
     }
 
@@ -188,4 +188,20 @@ void sockdrive_close(size_t handle) {
     if (handle) {
         delete reinterpret_cast<Drive*>(handle);
     }
+}
+
+uint32_t sockdrive_size(size_t handle) {
+    return 2097152;
+}
+uint32_t sockdrive_heads(size_t handle) {
+    return 128;
+}
+uint32_t sockdrive_sectors(size_t handle) {
+    return 63;
+}
+uint32_t sockdrive_cylinders(size_t handle) {
+    return 520;
+}
+uint32_t sockdrive_sector_size(size_t handle) {
+    return 512;
 }
