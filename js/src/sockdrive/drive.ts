@@ -23,7 +23,7 @@ export class Drive {
     token: string;
     stats: Stats;
 
-    socket: Promise<WebSocket>;
+    socket: Promise<WebSocket> = Promise.resolve(null as any);
     request: Request | null;
 
     aheadRange: number;
@@ -34,7 +34,7 @@ export class Drive {
     readAheadBuffer: Ptr;
     readAheadPos = 0;
     readAheadCompressed = 0;
-    readStartedAt: number;
+    readStartedAt: number = 0;
     decodeBuffer: Uint8Array;
 
     cache: Cache;
