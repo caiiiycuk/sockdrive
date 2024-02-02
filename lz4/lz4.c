@@ -2749,3 +2749,25 @@ char* LZ4_slideInputBuffer (void* state)
 }
 
 #endif   /* LZ4_COMMONDEFS_ONLY */
+
+#ifndef EMSCRIPTEN_KEEPALIVE
+#define EMSCRIPTEN_KEEPALIVE
+#endif
+
+#define COMPRESSED_BUFFER_SIZE 131072
+
+int EMSCRIPTEN_KEEPALIVE decode_lz4_block(uint32_t compressedSize, uint32_t decodedSize, char *buffer) {
+    if (compressedSize == decodedSize) {
+        return decodedSize;
+    }
+
+    // 128 * 1024 is for 255 aheadRange (maximum possible)
+    static char compressed[COMPRESSED_BUFFER_SIZE];
+
+    if (COMPRESSED_BUFFER_SIZE < compressedSize) {
+        return -1;
+    }
+
+    memcpy(compressed, buffer, compressedSize);
+    return LZ4_decompress_safe(compressed, buffer, compressedSize, decodedSize);
+}
