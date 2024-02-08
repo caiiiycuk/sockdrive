@@ -112,7 +112,7 @@ class Cache {
     cache_.clear();
     keys_.clear();
   }
-  void insert(const Key& k, uint8_t* ptr) {
+  void insert(const Key& k, std::vector<uint8_t>* ptr) {
     Guard g(lock_);
     const auto iter = cache_.find(k);
     if (iter != cache_.end()) {
@@ -121,7 +121,7 @@ class Cache {
       return;
     }
 
-    keys_.emplace_front(k, std::unique_ptr<uint8_t>(ptr));
+    keys_.emplace_front(k, std::unique_ptr<std::vector<uint8_t>>(ptr));
     cache_[k] = keys_.begin();
     prune();
   }
