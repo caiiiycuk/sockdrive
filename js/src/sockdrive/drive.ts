@@ -3,8 +3,6 @@ import { BlockCache, Cache } from "./cache";
 
 interface Module {
     HEAPU8: Uint8Array;
-    _decode_lz4_block?: (compressedSize: number,
-        decodedSize: number, ptr: Ptr) => number;
 }
 
 interface Request {
@@ -74,7 +72,6 @@ export class Drive {
         this.aheadSize = aheadRange * this.sectorSize;
         this.decodeBuffer = new Uint8Array(this.aheadSize);
         this.cache = new BlockCache(this.sectorSize, aheadRange, memoryLimit);
-
         this.retries = 3;
 
         this.reconnect();
@@ -257,18 +254,13 @@ export class Drive {
 
                 if (this.readAheadPos == this.readAheadCompressed) {
                     let decodeResult = this.aheadSize;
-                    if (this.readAheadCompressed != this.aheadSize) {
-                        if (this.module._decode_lz4_block !== undefined) {
-                            decodeResult = this.module._decode_lz4_block(
-                                this.readAheadCompressed, this.aheadSize, this.readAheadBuffer);
+                    if (this.readAheadCompressed < this.aheadSize) {
+                        const result = decodeLz4(this.module.HEAPU8, this.decodeBuffer, this.readAheadBuffer,
+                            this.readAheadBuffer + this.readAheadCompressed);
+                        if (result < 0) {
+                            decodeResult = result;
                         } else {
-                            const result = decodeLz4(this.module.HEAPU8.slice(this.readAheadBuffer,
-                                this.readAheadBuffer + this.aheadSize), this.decodeBuffer, 0, 0);
-                            if (result < 0) {
-                                decodeResult = result;
-                            } else {
-                                this.module.HEAPU8.set(this.decodeBuffer, this.readAheadBuffer);
-                            }
+                            this.module.HEAPU8.set(this.decodeBuffer, this.readAheadBuffer);
                         }
                     }
 

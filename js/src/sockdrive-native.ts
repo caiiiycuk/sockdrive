@@ -5,8 +5,6 @@ interface EmModule {
     HEAPU8: Uint8Array,
     _malloc: (len: number) => Ptr,
     _free: (ptr: Ptr) => void,
-    _decode_lz4_block?: (compressedSize: number,
-        decodedSize: number, ptr: Ptr) => number;
 };
 
 interface Template {
