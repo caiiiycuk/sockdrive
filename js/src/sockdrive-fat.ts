@@ -2,7 +2,7 @@ import { createFileSystem } from "./fatfs";
 
 const toBuffer = require("typedarray-to-buffer");
 import { Drive } from "./sockdrive/drive";
-import { Stats as SockdriveStats } from "./sockdrive/types";
+import { EmModule, Stats as SockdriveStats } from "./sockdrive/types";
 
 export interface Driver {
     sectorSize: number,
@@ -145,8 +145,8 @@ export async function createSockdriveFileSystem(endpoint: string,
                                                 ownerId: string,
                                                 driveId: string,
                                                 token: string,
-                                                onOpen: (read: boolean, write: boolean) => void = () => {},
-                                                onError: (e: Error) => void = () => {}) {
+                                                onOpen: (read: boolean, write: boolean) => void = () => { },
+                                                onError: (e: Error) => void = () => { }) {
     const stats: SockdriveStats = {
         read: 0,
         write: 0,
@@ -157,69 +157,71 @@ export async function createSockdriveFileSystem(endpoint: string,
     };
 
     const sectorSize = 512;
-    const module = {
-        HEAPU8: new Uint8Array(sectorSize * 255 + sectorSize),
+    const module: EmModule = {
+        HEAPU8: new Uint8Array(sectorSize + 2048 * 1024 * 1024 + 4 + 1),
+        _malloc: () => sectorSize,
+        _free: () => { },
     };
 
-    // TODO: drive should provide size and disk geometry
-    const drive = new Drive(endpoint, ownerId, driveId, token,
-        stats, module, sectorSize, 255, sectorSize);
-    drive.onOpen(onOpen);
-    drive.onError(onError);
-    const imageSize = 2 * 1024 * 1024 * 1024; // 2GB //FIX!
+    let drive: Drive | null = null;
+    const fs = await new Promise<FileSystemApi>((resolve, reject) => {
+        drive = new Drive(endpoint, ownerId, driveId, token, stats, module);
+        drive.onOpen((read, write) => {
+            const imageSize = 2 * 1024 * 1024 * 1024; // 2GB //FIX!
 
-    // TODO: fatfs should respect boot record section
-    const MBR_OFFSET = 63;
-    const driver: Driver = {
-        sectorSize,
-        numSectors: imageSize / sectorSize,
-        readSectors: function(start, dst, cb) {
-            (async () => {
-                start += MBR_OFFSET;
-                // TODO we can avoid copying in dst.set
-                for (let i = 0; i < dst.length / sectorSize; ++i) {
-                    if (drive.read(start + i, 0, true) !== 0) {
-                        const readCode = await drive.read(start + i, 0, false);
-                        if (readCode !== 0) {
-                            cb(new Error("Read error, code: " + readCode), dst);
+            // TODO: fatfs should respect boot record section
+            const MBR_OFFSET = 63;
+            const driver: Driver = {
+                sectorSize,
+                numSectors: imageSize / sectorSize,
+                readSectors: function(start, dst, cb) {
+                    (async () => {
+                        start += MBR_OFFSET;
+                        // TODO we can avoid copying in dst.set
+                        for (let i = 0; i < dst.length / sectorSize; ++i) {
+                            if (drive.read(start + i, 0, true) !== 0) {
+                                const readCode = await drive.read(start + i, 0, false);
+                                if (readCode !== 0) {
+                                    cb(new Error("Read error, code: " + readCode), dst);
+                                    return;
+                                }
+                            }
+                            dst.set(module.HEAPU8.slice(0, sectorSize), i * sectorSize);
+                        }
+                    })()
+                        .then(() => cb(null, dst))
+                        .catch((e) => cb(e, dst));
+                },
+                writeSectors: function(start, data, cb) {
+                    start += MBR_OFFSET;
+                    for (let i = 0; i < data.length / sectorSize; ++i) {
+                        module.HEAPU8.set(data.slice(i * sectorSize, (i + 1) * sectorSize), 0);
+                        const writeCode = drive.write(start + i, 0);
+                        if (writeCode !== 0) {
+                            cb(new Error("Write error, code: " + 0));
                             return;
                         }
                     }
-                    dst.set(module.HEAPU8.slice(0, sectorSize), i * sectorSize);
+                    cb(null);
+                },
+            };
+            const fs = (createFileSystem as any as CreateFileSystemApi)(driver, {}, (ev, reason) => {
+                if (ev === "ready") {
+                    resolve(fs);
+                } else {
+                    console.error(ev, reason);
+                    reject(reason);
                 }
-            })()
-                .then(() => cb(null, dst))
-                .catch((e) => cb(e, dst));
-        },
-        writeSectors: function(start, data, cb) {
-            start += MBR_OFFSET;
-            for (let i = 0; i < data.length / sectorSize; ++i) {
-                module.HEAPU8.set(data.slice(i * sectorSize, (i + 1) * sectorSize), 0);
-                const writeCode = drive.write(start + i, 0);
-                if (writeCode !== 0) {
-                    cb(new Error("Write error, code: " + 0));
-                    return;
-                }
-            }
-            cb(null);
-        },
-    };
-
-    const fs = await new Promise<FileSystemApi>((resolve, reject) => {
-        const fs = (createFileSystem as any as CreateFileSystemApi)(driver, {}, (ev, reason) => {
-            if (ev === "ready") {
-                resolve(fs);
-            } else {
-                console.error(ev, reason);
-                reject(reason);
-            }
+            });
+            onOpen(read, write);
         });
+        drive.onError(onError);
     });
 
     return {
         stats,
         fs: new FileSystem(fs),
-        close: () => drive.close(),
+        close: () => drive?.close(),
     };
 }
 

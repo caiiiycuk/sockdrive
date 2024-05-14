@@ -1,9 +1,7 @@
-import { Ptr, Stats } from "./types";
+import { EmModule, Ptr, Stats } from "./types";
 import { BlockCache, Cache } from "./cache";
 
-interface Module {
-    HEAPU8: Uint8Array;
-}
+const MAX_FRAME_SIZE = 2048 * 1024 * 1024;
 
 interface Request {
     type: 1 | 2, // read | write
@@ -13,7 +11,7 @@ interface Request {
 }
 
 export class Drive {
-    module: Module;
+    module: EmModule;
     sectorSize: number;
     endpoint: string;
     owner: string;
@@ -28,6 +26,7 @@ export class Drive {
     aheadSize: number;
     writeBuffer: Uint8Array;
 
+    maxRead: number;
     readBuffer: Uint8Array;
     readAheadBuffer: Ptr;
     readAheadPos = 0;
@@ -48,30 +47,17 @@ export class Drive {
         drive: string,
         token: string,
         stats: Stats,
-        module: Module,
-        readAheadBuffer: Ptr,
-        aheadRange: number,
-        sectorSize = 512,
-        memoryLimit = 32 * 1024 * 1024) {
-        if (aheadRange > 255) {
-            throw new Error("Maximum aheadRange is 255");
-        }
-
-        this.sectorSize = sectorSize;
+        module: EmModule) {
+        this.sectorSize = 512;
         this.module = module;
         this.endpoint = endpoint;
         this.owner = owner;
         this.drive = drive;
         this.token = token;
         this.request = null;
-        this.readBuffer = new Uint8Array(1 + 4 + 1);
         this.writeBuffer = new Uint8Array(1 + 4 + this.sectorSize);
-        this.readAheadBuffer = readAheadBuffer;
+        this.readAheadBuffer = 0;
         this.stats = stats;
-        this.aheadRange = aheadRange;
-        this.aheadSize = aheadRange * this.sectorSize;
-        this.decodeBuffer = new Uint8Array(this.aheadSize);
-        this.cache = new BlockCache(this.sectorSize, aheadRange, memoryLimit);
         this.retries = 3;
 
         this.reconnect();
@@ -85,7 +71,6 @@ export class Drive {
         this.openFn = openFn;
     }
 
-
     public reconnect(): void {
         this.socket = new Promise<WebSocket>((resolve, reject) => {
             const socket = new WebSocket(this.endpoint);
@@ -94,9 +79,24 @@ export class Drive {
             const onOpen = () => {
                 const onInit = (event: { data: string }) => {
                     socket.removeEventListener("message", onInit);
-                    if (event.data === "write" || event.data === "read") {
+                    if (event.data.startsWith("write") || event.data.startsWith("read")) {
+                        const [mode, aheadRangeStr] = event.data.split(",");
+                        const aheadRange = Number.parseInt(aheadRangeStr);
+                        this.aheadRange = aheadRange;
+                        this.aheadSize = aheadRange * this.sectorSize;
+                        this.maxRead = Math.floor(MAX_FRAME_SIZE / this.aheadSize);
+
+                        const decodeBufferSize = this.aheadSize * this.maxRead;
+                        this.readBuffer = new Uint8Array(1 + 4 + this.maxRead * 4);
+                        this.decodeBuffer = new Uint8Array(decodeBufferSize);
+                        this.cache = new BlockCache(this.sectorSize, aheadRange);
+                        if (this.readAheadBuffer !== 0) {
+                            this.module._free(this.readAheadBuffer);
+                        }
+                        this.readAheadBuffer = this.module._malloc(decodeBufferSize);
+
                         socket.addEventListener("message", onMessage);
-                        this.openFn(true, event.data === "write");
+                        this.openFn(true, mode === "write");
                         resolve(socket);
                     } else {
                         const error = new Error(event.data ?? "Unable to establish connection");
@@ -193,6 +193,7 @@ export class Drive {
             this.cleanup();
             socket.close();
         } finally {
+            this.module._free(this.readAheadBuffer);
             this.readAheadBuffer = 0;
         }
     }
@@ -207,12 +208,15 @@ export class Drive {
                 this.readAheadCompressed = 0;
 
                 this.readBuffer[0] = 1; // read
-                this.readBuffer[1] = origin & 0xFF;
-                this.readBuffer[2] = (origin >> 8) & 0xFF;
-                this.readBuffer[3] = (origin >> 16) & 0xFF;
-                this.readBuffer[4] = (origin >> 24) & 0xFF;
-                this.readBuffer[5] = this.aheadRange;
-                socket.send(this.readBuffer.buffer);
+                this.readBuffer[1] = 1 & 0xFF;
+                this.readBuffer[2] = (1 >> 8) & 0xFF;
+                this.readBuffer[3] = (1 >> 16) & 0xFF;
+                this.readBuffer[4] = (1 >> 24) & 0xFF;
+                this.readBuffer[5] = origin & 0xFF;
+                this.readBuffer[6] = (origin >> 8) & 0xFF;
+                this.readBuffer[7] = (origin >> 16) & 0xFF;
+                this.readBuffer[8] = (origin >> 24) & 0xFF;
+                socket.send(this.readBuffer.slice(0, 9).buffer);
             } else {
                 const { sector, buffer, resolve } = request;
                 this.stats.write += this.sectorSize;
@@ -260,7 +264,7 @@ export class Drive {
                         if (result < 0) {
                             decodeResult = result;
                         } else {
-                            this.module.HEAPU8.set(this.decodeBuffer, this.readAheadBuffer);
+                            this.module.HEAPU8.set(this.decodeBuffer.slice(0, this.aheadSize), this.readAheadBuffer);
                         }
                     }
 

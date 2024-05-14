@@ -1,11 +1,5 @@
-import { Handle, Ptr, Stats } from "./sockdrive/types";
+import { EmModule, Handle, Ptr, Stats } from "./sockdrive/types";
 import { Drive } from "./sockdrive/drive";
-
-interface EmModule {
-    HEAPU8: Uint8Array,
-    _malloc: (len: number) => Ptr,
-    _free: (ptr: Ptr) => void,
-};
 
 interface Template {
     name: string,
@@ -47,8 +41,7 @@ declare const Module: EmModule & any;
             }
             seq++;
             templates[seq] = template;
-            mapping[seq] = new Drive(url, owner, name, token, stats, Module,
-                Module._malloc(512 * 255), 255, 512);
+            mapping[seq] = new Drive(url, owner, name, token, stats, Module);
             mapping[seq].onOpen((read, write) => {
                 Module.sockdrive.onOpen(owner + "/" + name, read, write);
             });

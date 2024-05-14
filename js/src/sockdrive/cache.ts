@@ -13,7 +13,7 @@ export class BlockCache implements Cache {
     sectorSize: number;
     lru: LRUMap;
 
-    constructor(sectorSize: number, aheadRange: number, memoryLimit: number) {
+    constructor(sectorSize: number, aheadRange: number, memoryLimit: number = 32 * 1024 * 1024) {
         this.aheadRange = aheadRange;
         this.sectorSize = sectorSize;
         this.lru = new LRUMap(Math.floor(memoryLimit / (aheadRange * sectorSize)));
