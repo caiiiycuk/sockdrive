@@ -11,6 +11,4 @@ export interface Stats {
 
 export interface EmModule {
     HEAPU8: Uint8Array,
-    _malloc: (len: number) => Ptr,
-    _free: (ptr: Ptr) => void,
 };

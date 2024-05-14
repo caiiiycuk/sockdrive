@@ -158,17 +158,13 @@ export async function createSockdriveFileSystem(endpoint: string,
 
     const sectorSize = 512;
     const module: EmModule = {
-        HEAPU8: new Uint8Array(sectorSize + 2048 * 1024 * 1024 + 4 + 1),
-        _malloc: () => sectorSize,
-        _free: () => { },
+        HEAPU8: new Uint8Array(sectorSize),
     };
 
     let drive: Drive | null = null;
     const fs = await new Promise<FileSystemApi>((resolve, reject) => {
         drive = new Drive(endpoint, ownerId, driveId, token, stats, module);
-        drive.onOpen((read, write) => {
-            const imageSize = 2 * 1024 * 1024 * 1024; // 2GB //FIX!
-
+        drive.onOpen((read, write, imageSize) => {
             // TODO: fatfs should respect boot record section
             const MBR_OFFSET = 63;
             const driver: Driver = {

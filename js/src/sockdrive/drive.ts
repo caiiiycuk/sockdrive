@@ -27,17 +27,17 @@ export class Drive {
     writeBuffer: Uint8Array;
 
     maxRead: number;
-    readBuffer: Uint8Array;
-    readAheadBuffer: Ptr;
+    readBuffer: Uint8Array = new Uint8Array(0);
+    readAheadBuffer: Uint8Array = new Uint8Array(0);
     readAheadPos = 0;
     readAheadCompressed = 0;
     readStartedAt: number = 0;
-    decodeBuffer: Uint8Array;
+    decodeBuffer: Uint8Array = new Uint8Array(0);
 
     cache: Cache;
     cleanup = () => {/**/};
 
-    openFn = (read: boolean, write: boolean) => {/**/};
+    openFn = (read: boolean, write: boolean, size: number) => {/**/};
     errorFn = (e: Error) => {/**/};
 
     retries: number;
@@ -56,7 +56,6 @@ export class Drive {
         this.token = token;
         this.request = null;
         this.writeBuffer = new Uint8Array(1 + 4 + this.sectorSize);
-        this.readAheadBuffer = 0;
         this.stats = stats;
         this.retries = 3;
 
@@ -67,7 +66,7 @@ export class Drive {
         this.errorFn = errorFn;
     }
 
-    public onOpen(openFn: (read: boolean, write: boolean) => void) {
+    public onOpen(openFn: (read: boolean, write: boolean, imageSize: number) => void) {
         this.openFn = openFn;
     }
 
@@ -80,7 +79,7 @@ export class Drive {
                 const onInit = (event: { data: string }) => {
                     socket.removeEventListener("message", onInit);
                     if (event.data.startsWith("write") || event.data.startsWith("read")) {
-                        const [mode, aheadRangeStr] = event.data.split(",");
+                        const [mode, aheadRangeStr, sizeStr] = event.data.split(",");
                         const aheadRange = Number.parseInt(aheadRangeStr);
                         this.aheadRange = aheadRange;
                         this.aheadSize = aheadRange * this.sectorSize;
@@ -88,15 +87,12 @@ export class Drive {
 
                         const decodeBufferSize = this.aheadSize * this.maxRead;
                         this.readBuffer = new Uint8Array(1 + 4 + this.maxRead * 4);
+                        this.readAheadBuffer = new Uint8Array(decodeBufferSize);
                         this.decodeBuffer = new Uint8Array(decodeBufferSize);
                         this.cache = new BlockCache(this.sectorSize, aheadRange);
-                        if (this.readAheadBuffer !== 0) {
-                            this.module._free(this.readAheadBuffer);
-                        }
-                        this.readAheadBuffer = this.module._malloc(decodeBufferSize);
 
                         socket.addEventListener("message", onMessage);
-                        this.openFn(true, mode === "write");
+                        this.openFn(true, mode === "write", (Number.parseInt(sizeStr) ?? 2 * 1024 * 1024) * 1024);
                         resolve(socket);
                     } else {
                         const error = new Error(event.data ?? "Unable to establish connection");
@@ -180,22 +176,17 @@ export class Drive {
     }
 
     public async close() {
-        try {
-            const socket = await this.socket;
-            await new Promise<void>((resolve) => {
-                const intervalId = setInterval(() => {
-                    if (socket.bufferedAmount === 0) {
-                        clearInterval(intervalId);
-                        resolve();
-                    }
-                }, 32);
-            });
-            this.cleanup();
-            socket.close();
-        } finally {
-            this.module._free(this.readAheadBuffer);
-            this.readAheadBuffer = 0;
-        }
+        const socket = await this.socket;
+        await new Promise<void>((resolve) => {
+            const intervalId = setInterval(() => {
+                if (socket.bufferedAmount === 0) {
+                    clearInterval(intervalId);
+                    resolve();
+                }
+            }, 32);
+        });
+        this.cleanup();
+        socket.close();
     }
 
     private executeRequest(request: Request) {
@@ -253,18 +244,17 @@ export class Drive {
                 console.error("wrong read payload length " + data.byteLength + " instead of " + restLength);
                 resolve(3);
             } else {
-                this.module.HEAPU8.set(data, this.readAheadBuffer + this.readAheadPos);
+                this.readAheadBuffer.set(data, this.readAheadPos);
                 this.readAheadPos += data.byteLength;
 
                 if (this.readAheadPos == this.readAheadCompressed) {
                     let decodeResult = this.aheadSize;
                     if (this.readAheadCompressed < this.aheadSize) {
-                        const result = decodeLz4(this.module.HEAPU8, this.decodeBuffer, this.readAheadBuffer,
-                            this.readAheadBuffer + this.readAheadCompressed);
+                        const result = decodeLz4(this.readAheadBuffer, this.decodeBuffer, 0, this.readAheadCompressed);
                         if (result < 0) {
                             decodeResult = result;
                         } else {
-                            this.module.HEAPU8.set(this.decodeBuffer.slice(0, this.aheadSize), this.readAheadBuffer);
+                            this.readAheadBuffer.set(this.decodeBuffer.slice(0, this.aheadSize), 0);
                         }
                     }
 
@@ -273,14 +263,11 @@ export class Drive {
                         resolve(4);
                     } else {
                         const origin = this.cache.getOrigin(sector);
-                        this.cache.create(origin,
-                            this.module.HEAPU8.slice(this.readAheadBuffer, this.readAheadBuffer + this.aheadSize));
+                        this.cache.create(origin, this.readAheadBuffer.slice(0, this.aheadSize));
                         this.stats.cacheUsed = this.cache.memUsed();
                         const offset = sector - origin;
-                        this.module.HEAPU8.set(
-                            this.module.HEAPU8.slice(this.readAheadBuffer + offset * this.sectorSize,
-                                this.readAheadBuffer + (offset + 1) * this.sectorSize),
-                            buffer as number);
+                        this.module.HEAPU8.set(this.readAheadBuffer.slice(offset * this.sectorSize,
+                            (offset + 1) * this.sectorSize), buffer as number);
                         this.stats.read += this.readAheadCompressed;
                         this.stats.readTotalTime += Date.now() - this.readStartedAt;
                         this.request = null;
