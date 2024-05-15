@@ -5,7 +5,7 @@ const MAX_FRAME_SIZE = 2048 * 1024 * 1024;
 
 interface Request {
     type: 1 | 2, // read | write
-    sector: number,
+    sectors: number[],
     buffer: Ptr | Uint8Array,
     resolve: (result: number) => void,
 }
@@ -21,6 +21,7 @@ export class Drive {
 
     socket: Promise<WebSocket> = Promise.resolve(null as any);
     request: Request | null;
+    pendingRequest: Request | null;
 
     aheadRange: number;
     aheadSize: number;
@@ -55,6 +56,7 @@ export class Drive {
         this.drive = drive;
         this.token = token;
         this.request = null;
+        this.pendingRequest = null;
         this.writeBuffer = new Uint8Array(1 + 4 + this.sectorSize);
         this.stats = stats;
         this.retries = 3;
@@ -132,11 +134,6 @@ export class Drive {
     }
 
     public read(sector: number, buffer: Ptr, sync: boolean): Promise<number> | number {
-        if (this.request !== null && this.request.type === 1) {
-            console.error("New read request while old one is still processed");
-            return sync ? 3 : Promise.resolve(3);
-        }
-
         const cached = this.cache.read(sector);
         if (cached !== null) {
             if (sync) {
@@ -147,31 +144,41 @@ export class Drive {
             return sync ? 0 : Promise.resolve(0);
         } else if (sync) {
             return 255;
+        } else {
+            return new Promise<number>((resolve) => {
+                this.stats.cacheMiss++;
+
+                const request: Request = {
+                    type: 1,
+                    sectors: [sector],
+                    buffer,
+                    resolve,
+                };
+
+                if (this.request !== null) {
+                    if (this.pendingRequest !== null) {
+                        this.pendingRequest = request;
+                    } else {
+                        console.error("New read request while old one is still processed");
+                        resolve(3);
+                    }
+                } else {
+                    this.request = request;
+                    this.executeRequest(this.request);
+                }
+            });
         }
-
-        this.stats.cacheMiss++;
-
-        return new Promise<number>((resolve) => {
-            this.request = {
-                type: 1,
-                sector,
-                buffer,
-                resolve,
-            };
-            this.executeRequest(this.request);
-        });
     }
 
     public write(sector: number, buffer: Ptr): number {
-        this.request = {
+        const request: Request = {
             type: 2,
-            sector,
+            sectors: [sector],
             buffer: this.module.HEAPU8.slice(buffer, buffer + this.sectorSize),
             resolve: () => {/**/},
         };
-        this.cache.write(sector, this.request.buffer as Uint8Array);
-        this.executeRequest(this.request);
-
+        this.cache.write(sector, request.buffer as Uint8Array);
+        this.executeRequest(request);
         return 0;
     }
 
@@ -192,30 +199,39 @@ export class Drive {
     private executeRequest(request: Request) {
         this.socket.then((socket) => {
             if (request.type === 1) {
-                const { sector } = request;
-                const origin = this.cache.getOrigin(sector);
+                const { sectors } = request;
                 this.readStartedAt = Date.now();
                 this.readAheadPos = 0;
                 this.readAheadCompressed = 0;
-
                 this.readBuffer[0] = 1; // read
-                this.readBuffer[1] = 1 & 0xFF;
-                this.readBuffer[2] = (1 >> 8) & 0xFF;
-                this.readBuffer[3] = (1 >> 16) & 0xFF;
-                this.readBuffer[4] = (1 >> 24) & 0xFF;
-                this.readBuffer[5] = origin & 0xFF;
-                this.readBuffer[6] = (origin >> 8) & 0xFF;
-                this.readBuffer[7] = (origin >> 16) & 0xFF;
-                this.readBuffer[8] = (origin >> 24) & 0xFF;
-                socket.send(this.readBuffer.slice(0, 9).buffer);
+                this.readBuffer[1] = sectors.length & 0xFF;
+                this.readBuffer[2] = (sectors.length >> 8) & 0xFF;
+                this.readBuffer[3] = (sectors.length >> 16) & 0xFF;
+                this.readBuffer[4] = (sectors.length >> 24) & 0xFF;
+
+                for (let i = 0; i < sectors.length; ++i) {
+                    const origin = this.cache.getOrigin(sectors[i]);
+
+                    if (i > 0 && origin !== sectors[i]) {
+                        console.error("Assertion failed orign should equal to sector", origin, sectors[i]);
+                        request.resolve(5);
+                        return;
+                    }
+
+                    this.readBuffer[5 + i * 4] = origin & 0xFF;
+                    this.readBuffer[5 + i * 4 + 1] = (origin >> 8) & 0xFF;
+                    this.readBuffer[5 + i * 4 + 2] = (origin >> 16) & 0xFF;
+                    this.readBuffer[5 + i * 4 + 3] = (origin >> 24) & 0xFF;
+                }
+                socket.send(this.readBuffer.slice(0, sectors.length * 4 + 5).buffer);
             } else {
-                const { sector, buffer, resolve } = request;
+                const { sectors, buffer, resolve } = request;
                 this.stats.write += this.sectorSize;
                 this.writeBuffer[0] = 2; // write
-                this.writeBuffer[1] = sector & 0xFF;
-                this.writeBuffer[2] = (sector >> 8) & 0xFF;
-                this.writeBuffer[3] = (sector >> 16) & 0xFF;
-                this.writeBuffer[4] = (sector >> 24) & 0xFF;
+                this.writeBuffer[1] = sectors[0] & 0xFF;
+                this.writeBuffer[2] = (sectors[0] >> 8) & 0xFF;
+                this.writeBuffer[3] = (sectors[0] >> 16) & 0xFF;
+                this.writeBuffer[4] = (sectors[0] >> 24) & 0xFF;
                 // TBD: maybe do not copy and send just slice ???
                 this.writeBuffer.set(buffer as Uint8Array, 5);
                 socket.send(this.writeBuffer.buffer);
@@ -238,7 +254,8 @@ export class Drive {
                 data = data.slice(4);
             }
 
-            const { sector, buffer, resolve } = this.request;
+            const { sectors, buffer, resolve } = this.request;
+            const sector = sectors[0];
             const restLength = this.readAheadCompressed - this.readAheadPos;
             if (data.byteLength > restLength || restLength < 0 || restLength > this.aheadSize) {
                 console.error("wrong read payload length " + data.byteLength + " instead of " + restLength);
