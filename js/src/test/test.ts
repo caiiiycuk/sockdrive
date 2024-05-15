@@ -1,4 +1,6 @@
 import { FileSystem, FileSystemApi, CreateFileSystemApi, Driver, CreateSockdriveFileSystem } from "../sockdrive-fat";
+import { Drive } from "../sockdrive/drive";
+import { EmModule, Stats } from "../sockdrive/types";
 
 declare const createFileSystem: CreateFileSystemApi;
 declare const createSockdriveFileSystem: CreateSockdriveFileSystem;
@@ -136,6 +138,98 @@ async function runTests() {
             await testHelpers(fs);
         });
     }
+
+    suite("Drive 127.0.0.1:8001");
+
+    const testDrive = (name: string,
+        fn: (drive: Drive, module: EmModule, stats: Stats, preloadQueue: number[]) => Promise<void>,
+        preload = false) => {
+        test(name, async () => {
+            const module: EmModule = {
+                HEAPU8: new Uint8Array(512),
+            };
+
+            const stats: Stats = {
+                read: 0,
+                write: 0,
+                readTotalTime: 0,
+                cacheHit: 0,
+                cacheMiss: 0,
+                cacheUsed: 0,
+            };
+
+            const drive = new Drive("ws://127.0.0.1:8001", "system", "test", "", stats, module, preload);
+            let preloadQueue: number[] = [];
+            await new Promise<void>((resolve, reject) => {
+                drive.onOpen((read, write, imageSize, preload) => {
+                    if (!preload) {
+                        assert.equal(0, preload.length);
+                    }
+                    preloadQueue = preload;
+                    resolve();
+                });
+                drive.onError((e) => {
+                    reject(e);
+                });
+            });
+
+            await fn(drive, module, stats, preloadQueue);
+            await drive.close();
+        });
+    };
+
+    testDrive("read sector", async (drive, module, stats) => {
+        assert.equal(await drive.read(0, 0, false), 0);
+        assert.deepEqual(module.HEAPU8.slice(0, 10), new Uint8Array([51, 192, 142, 208, 188, 0, 124, 251, 80, 7]));
+        assert.equal(1, stats.cacheMiss, "cache miss");
+
+        assert.equal(await drive.read(8192, 0, false), 0);
+        assert.deepEqual(module.HEAPU8.slice(0, 10), new Uint8Array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+        assert.equal(2, stats.cacheMiss, "cache miss");
+
+        assert.equal(await drive.read(8448, 0, false), 0);
+        assert.deepEqual(module.HEAPU8.slice(256, 256 + 10), new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]));
+        assert.equal(3, stats.cacheMiss, "cache miss");
+    });
+
+    testDrive("read cache", async (drive, module, stats) => {
+        assert.equal(await drive.read(0, 0, false), 0);
+        assert.equal(0, stats.cacheHit, "cache hit");
+        assert.equal(1, stats.cacheMiss, "cache miss");
+
+        for (let i = 0; i < 128; ++i) {
+            assert.equal(await drive.read(1 + i, 0, true), 0);
+            assert.equal(i + 1, stats.cacheHit, "cache hit");
+            assert.equal(1, stats.cacheMiss, "cache miss");
+            if (i == 62) {
+                assert.deepEqual(module.HEAPU8.slice(0, 10),
+                    new Uint8Array([235, 88, 144, 77, 83, 87, 73, 78, 52, 46]));
+            }
+            if (i == 127) {
+                assert.deepEqual(module.HEAPU8.slice(0, 10),
+                    new Uint8Array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+            }
+        }
+    });
+
+    testDrive("preload sectors", async (drive, module, stats, preloadQueue) => {
+        assert.equal(3, preloadQueue.length);
+        for (const next of preloadQueue) {
+            assert.ok(next === 0 || next === 8448 || next === 8192);
+        }
+
+        assert.equal(drive.read(0, 0, true), 0, "sector 0 in cache");
+        assert.deepEqual(module.HEAPU8.slice(0, 10), new Uint8Array([51, 192, 142, 208, 188, 0, 124, 251, 80, 7]));
+
+        assert.equal(await drive.read(8192, 0, true), 0, "sector 8192 in cache");
+        assert.deepEqual(module.HEAPU8.slice(0, 10), new Uint8Array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+
+        assert.equal(await drive.read(8448, 0, true), 0, "sector 8448 in cache");
+        assert.deepEqual(module.HEAPU8.slice(256, 256 + 10), new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]));
+
+        assert.equal(3, stats.cacheHit, "cache hit");
+        assert.equal(0, stats.cacheMiss, "cache miss");
+    }, true);
 
     suite("sockdrive 127.0.0.1:8001");
 

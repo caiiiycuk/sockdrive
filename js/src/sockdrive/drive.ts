@@ -38,17 +38,21 @@ export class Drive {
     cache: Cache;
     cleanup = () => {/**/};
 
-    openFn = (read: boolean, write: boolean, size: number) => {/**/};
+    openFn = (read: boolean, write: boolean, size: number, preloadQueue: number[]) => {/**/};
     errorFn = (e: Error) => {/**/};
 
     retries: number;
+
+    preloadSectors: boolean;
+    preloadQueue: number[];
 
     public constructor(endpoint: string,
         owner: string,
         drive: string,
         token: string,
         stats: Stats,
-        module: EmModule) {
+        module: EmModule,
+        preloadSectors = true) {
         this.sectorSize = 512;
         this.module = module;
         this.endpoint = endpoint;
@@ -60,6 +64,7 @@ export class Drive {
         this.writeBuffer = new Uint8Array(1 + 4 + this.sectorSize);
         this.stats = stats;
         this.retries = 3;
+        this.preloadSectors = preloadSectors;
 
         this.reconnect();
     }
@@ -68,7 +73,7 @@ export class Drive {
         this.errorFn = errorFn;
     }
 
-    public onOpen(openFn: (read: boolean, write: boolean, imageSize: number) => void) {
+    public onOpen(openFn: (read: boolean, write: boolean, imageSize: number, preloadQueue: number[]) => void) {
         this.openFn = openFn;
     }
 
@@ -93,9 +98,43 @@ export class Drive {
                         this.decodeBuffer = new Uint8Array(decodeBufferSize);
                         this.cache = new BlockCache(this.sectorSize, aheadRange);
 
-                        socket.addEventListener("message", onMessage);
-                        this.openFn(true, mode === "write", (Number.parseInt(sizeStr) ?? 2 * 1024 * 1024) * 1024);
-                        resolve(socket);
+                        let preloadLength = 0;
+                        let preloadPos = 0;
+                        let preload: Uint8Array = new Uint8Array(0);
+                        const onPreloadMessage = (event: { data: ArrayBuffer }) => {
+                            let data = new Uint8Array(event.data);
+                            if (preloadLength === 0) {
+                                preloadLength = data[0] + (data[1] << 8) + (data[2] << 16) + (data[3] << 24);
+                                preload = new Uint8Array(preloadLength - 4);
+                                data = data.slice(4);
+                            }
+
+                            if (preloadPos < preloadLength) {
+                                preload.set(data, preloadPos);
+                                preloadPos += data.length;
+                            }
+
+                            if (preloadPos > preload.length) {
+                                const error = new Error("Preload buffer is bigger then expected");
+                                this.errorFn(error);
+                                reject(error);
+                            } else if (preloadPos == preload.length) {
+                                this.preloadQueue = [];
+                                if (this.preloadSectors) {
+                                    for (let i = 0; i < preload.length; i += 4) {
+                                        this.preloadQueue.push(preload[i] + (preload[i + 1] << 8) +
+                                            (preload[i + 2] << 16) + (preload[i + 3] << 24));
+                                    }
+                                }
+                                socket.removeEventListener("message", onPreloadMessage);
+                                socket.addEventListener("message", onMessage);
+                                this.openFn(true, mode === "write",
+                                    (Number.parseInt(sizeStr) ?? 2 * 1024 * 1024) * 1024,
+                                    this.preloadQueue);
+                                resolve(socket);
+                            }
+                        };
+                        socket.addEventListener("message", onPreloadMessage);
                     } else {
                         const error = new Error(event.data ?? "Unable to establish connection");
                         this.errorFn(error);
