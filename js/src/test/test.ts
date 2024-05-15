@@ -165,7 +165,7 @@ async function runTests() {
                     if (!preload) {
                         assert.equal(0, preload.length);
                     }
-                    preloadQueue = preload;
+                    preloadQueue = [...preload];
                     resolve();
                 });
                 drive.onError((e) => {
@@ -213,10 +213,18 @@ async function runTests() {
     });
 
     testDrive("preload sectors", async (drive, module, stats, preloadQueue) => {
-        assert.equal(3, preloadQueue.length);
+        assert.ok(preloadQueue.length >= 3);
+        let _0 = false;
+        let _8448 = false;
+        let _8192 = false;
         for (const next of preloadQueue) {
-            assert.ok(next === 0 || next === 8448 || next === 8192);
+            _0 = _0 || next === 0;
+            _8192 = _8192 || next === 8192;
+            _8448 = _8448 || next === 8448;
         }
+        assert.ok(_0 && _8192 && _8448);
+
+        await new Promise<void>((resolve) => setTimeout(resolve, 1000));
 
         assert.equal(drive.read(0, 0, true), 0, "sector 0 in cache");
         assert.deepEqual(module.HEAPU8.slice(0, 10), new Uint8Array([51, 192, 142, 208, 188, 0, 124, 251, 80, 7]));

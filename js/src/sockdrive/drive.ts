@@ -1,7 +1,7 @@
 import { EmModule, Ptr, Stats } from "./types";
 import { BlockCache, Cache } from "./cache";
 
-const MAX_FRAME_SIZE = 2048 * 1024 * 1024;
+const MAX_FRAME_SIZE = 2 * 1024 * 1024;
 
 interface Request {
     type: 1 | 2, // read | write
@@ -132,6 +132,11 @@ export class Drive {
                                     (Number.parseInt(sizeStr) ?? 2 * 1024 * 1024) * 1024,
                                     this.preloadQueue);
                                 resolve(socket);
+
+                                if (this.preloadQueue.length > 0) {
+                                    this.request = this.makeReadRequest(this.preloadQueue.shift());
+                                    this.executeRequest(this.request);
+                                }
                             }
                         };
                         socket.addEventListener("message", onPreloadMessage);
@@ -172,6 +177,22 @@ export class Drive {
         }
     }
 
+    private makeReadRequest(sector: number, buffer: number = -1, resolve: (res: number) => void = () => { }): Request {
+        const sectors: number[] = [sector];
+        while (this.preloadQueue.length > 0 && sectors.length < this.maxRead) {
+            const preload = this.preloadQueue.shift();
+            if (preload !== sector) {
+                sectors.push(preload);
+            }
+        }
+        return {
+            type: 1,
+            sectors,
+            buffer,
+            resolve,
+        };
+    }
+
     public read(sector: number, buffer: Ptr, sync: boolean): Promise<number> | number {
         const cached = this.cache.read(sector);
         if (cached !== null) {
@@ -187,15 +208,9 @@ export class Drive {
             return new Promise<number>((resolve) => {
                 this.stats.cacheMiss++;
 
-                const request: Request = {
-                    type: 1,
-                    sectors: [sector],
-                    buffer,
-                    resolve,
-                };
-
+                const request: Request = this.makeReadRequest(sector, buffer, resolve);
                 if (this.request !== null) {
-                    if (this.pendingRequest !== null) {
+                    if (this.pendingRequest === null) {
                         this.pendingRequest = request;
                     } else {
                         console.error("New read request while old one is still processed");
@@ -294,40 +309,58 @@ export class Drive {
             }
 
             const { sectors, buffer, resolve } = this.request;
-            const sector = sectors[0];
             const restLength = this.readAheadCompressed - this.readAheadPos;
-            if (data.byteLength > restLength || restLength < 0 || restLength > this.aheadSize) {
+            if (data.byteLength > restLength || restLength < 0) {
                 console.error("wrong read payload length " + data.byteLength + " instead of " + restLength);
                 resolve(3);
             } else {
                 this.readAheadBuffer.set(data, this.readAheadPos);
                 this.readAheadPos += data.byteLength;
+                const expectedSize = this.aheadSize * sectors.length;
 
                 if (this.readAheadPos == this.readAheadCompressed) {
-                    let decodeResult = this.aheadSize;
-                    if (this.readAheadCompressed < this.aheadSize) {
+                    let decodeResult = expectedSize;
+                    if (this.readAheadCompressed < expectedSize) {
                         const result = decodeLz4(this.readAheadBuffer, this.decodeBuffer, 0, this.readAheadCompressed);
                         if (result < 0) {
                             decodeResult = result;
                         } else {
-                            this.readAheadBuffer.set(this.decodeBuffer.slice(0, this.aheadSize), 0);
+                            this.readAheadBuffer.set(this.decodeBuffer.slice(0, expectedSize), 0);
                         }
                     }
 
-                    if (decodeResult != this.aheadSize) {
-                        console.error("wrong decode result " + decodeResult + " should be " + this.aheadSize);
+                    if (decodeResult != expectedSize) {
+                        console.error("wrong decode result " + decodeResult + " should be " + expectedSize);
                         resolve(4);
                     } else {
-                        const origin = this.cache.getOrigin(sector);
-                        this.cache.create(origin, this.readAheadBuffer.slice(0, this.aheadSize));
+                        for (let i = 0; i < sectors.length; ++i) {
+                            const aheadOffset = i * this.aheadSize;
+                            const sector = sectors[i];
+                            const origin = this.cache.getOrigin(sector);
+                            this.cache.create(origin,
+                                this.readAheadBuffer.slice(aheadOffset, aheadOffset + this.aheadSize));
+                            if (i == 0 && buffer as number >= 0) {
+                                const offset = sector - origin;
+                                // aheadOffset is zero
+                                this.module.HEAPU8.set(this.readAheadBuffer.slice(offset * this.sectorSize,
+                                    (offset + 1) * this.sectorSize), buffer as number);
+                            }
+                        }
+
                         this.stats.cacheUsed = this.cache.memUsed();
-                        const offset = sector - origin;
-                        this.module.HEAPU8.set(this.readAheadBuffer.slice(offset * this.sectorSize,
-                            (offset + 1) * this.sectorSize), buffer as number);
                         this.stats.read += this.readAheadCompressed;
                         this.stats.readTotalTime += Date.now() - this.readStartedAt;
                         this.request = null;
                         resolve(0);
+
+                        if (this.pendingRequest !== null) {
+                            this.request = this.pendingRequest;
+                            this.pendingRequest = null;
+                            this.executeRequest(this.request);
+                        } else if (this.preloadQueue.length > 0) {
+                            this.request = this.makeReadRequest(this.preloadQueue.shift());
+                            this.executeRequest(this.request);
+                        }
                     }
                 }
             }
