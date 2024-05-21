@@ -2,6 +2,7 @@ import { EmModule, Ptr, Stats } from "./types";
 import { BlockCache, Cache } from "./cache";
 
 const MAX_FRAME_SIZE = 2 * 1024 * 1024;
+const MEMORY_LIMIT = 32 * 1024 * 1024;
 
 interface Request {
     type: 1 | 2, // read | write
@@ -96,7 +97,7 @@ export class Drive {
                         this.readBuffer = new Uint8Array(1 + 4 + this.maxRead * 4);
                         this.readAheadBuffer = new Uint8Array(decodeBufferSize);
                         this.decodeBuffer = new Uint8Array(decodeBufferSize);
-                        this.cache = new BlockCache(this.sectorSize, aheadRange);
+                        this.cache = new BlockCache(this.sectorSize, aheadRange, MEMORY_LIMIT);
 
                         let preloadLength = 0;
                         let preloadPos = 0;
@@ -134,6 +135,13 @@ export class Drive {
                                 resolve(socket);
 
                                 if (this.preloadQueue.length > 0) {
+                                    if (this.preloadQueue.length * this.aheadSize > MEMORY_LIMIT) {
+                                        console.log("WARN! preloadQueue size is bigger then allowed",
+                                            this.preloadQueue.length * this.aheadSize / 1024 / 1024, ">",
+                                            MEMORY_LIMIT / 1024 / 1024);
+                                        this.preloadQueue = this.preloadQueue
+                                            .slice(0, Math.floor(MEMORY_LIMIT / this.aheadSize));
+                                    }
                                     this.request = this.makeReadRequest(this.preloadQueue.shift());
                                     this.executeRequest(this.request);
                                 }
@@ -199,7 +207,6 @@ export class Drive {
             if (sync) {
                 this.stats.cacheHit++;
             }
-            this.request = null;
             this.module.HEAPU8.set(cached, buffer);
             return sync ? 0 : Promise.resolve(0);
         } else if (sync) {

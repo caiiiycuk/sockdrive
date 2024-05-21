@@ -41,12 +41,17 @@ declare const Module: EmModule & any;
             }
             seq++;
             templates[seq] = template;
-            mapping[seq] = new Drive(url, owner, name, token, stats, Module);
-            mapping[seq].onOpen((read, write) => {
-                Module.sockdrive.onOpen(owner + "/" + name, read, write);
+            return new Promise<Handle>((resolve, reject) => {
+                mapping[seq] = new Drive(url, owner, name, token, stats, Module);
+                mapping[seq].onOpen((read, write, imageSize, preloadQueue) => {
+                    Module.sockdrive.onOpen(owner + "/" + name, read, write, imageSize, preloadQueue);
+                    resolve(seq);
+                });
+                mapping[seq].onError((e) => {
+                    Module.sockdrive.onError(e);
+                    reject(e);
+                });
             });
-            mapping[seq].onError(Module.sockdrive.onError);
-            return seq;
         },
         read: (handle: Handle, sector: number, buffer: Ptr, sync: boolean): Promise<number> | number => {
             if (mapping[handle]) {
