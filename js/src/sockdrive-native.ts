@@ -32,6 +32,9 @@ declare const Module: EmModule & any;
         onOpen: (drive: string, read: boolean, write: boolean) => {
             // noop
         },
+        onPreloadProgress: (dirve: string, restBytes: number) => {
+            // noop
+        },
         open: async (url: string, owner: string, name: string, token: string): Promise<Handle> => {
             const response = await fetch(url.replace("wss://", "https://")
                 .replace("ws://", "http://") + "/template/" + owner + "/" + name);
@@ -50,6 +53,9 @@ declare const Module: EmModule & any;
                 mapping[seq].onError((e) => {
                     Module.sockdrive.onError(e);
                     reject(e);
+                });
+                mapping[seq].onPreloadProgress((restBytes) => {
+                    Module.sockdrive.onPreloadProgress(owner + "/" + name, restBytes);
                 });
             });
         },

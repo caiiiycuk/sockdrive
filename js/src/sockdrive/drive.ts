@@ -1,8 +1,8 @@
 import { EmModule, Ptr, Stats } from "./types";
 import { BlockCache, Cache } from "./cache";
 
-const MAX_FRAME_SIZE = 2 * 1024 * 1024;
-const MEMORY_LIMIT = 32 * 1024 * 1024;
+const MAX_FRAME_SIZE = 1 * 1024 * 1024;
+const MEMORY_LIMIT = 64 * 1024 * 1024;
 
 interface Request {
     type: 1 | 2, // read | write
@@ -40,6 +40,7 @@ export class Drive {
     cleanup = () => {/**/};
 
     openFn = (read: boolean, write: boolean, size: number, preloadQueue: number[]) => {/**/};
+    preloadProgressFn = (restBytes: number) => {/**/};
     errorFn = (e: Error) => {/**/};
 
     retries: number;
@@ -76,6 +77,10 @@ export class Drive {
 
     public onOpen(openFn: (read: boolean, write: boolean, imageSize: number, preloadQueue: number[]) => void) {
         this.openFn = openFn;
+    }
+
+    public onPreloadProgress(progressFn: (restBytes: number) => void) {
+        this.preloadProgressFn = progressFn;
     }
 
     public reconnect(): void {
@@ -187,10 +192,19 @@ export class Drive {
 
     private makeReadRequest(sector: number, buffer: number = -1, resolve: (res: number) => void = () => { }): Request {
         const sectors: number[] = [sector];
-        while (this.preloadQueue.length > 0 && sectors.length < this.maxRead) {
-            const preload = this.preloadQueue.shift();
-            if (preload !== sector) {
-                sectors.push(preload);
+        if (this.preloadQueue.length > 0) {
+            this.preloadProgressFn(this.preloadQueue.length * this.aheadSize);
+            while (this.preloadQueue.length > 0 && sectors.length < this.maxRead) {
+                const preload = this.preloadQueue.shift();
+                if (preload !== sector) {
+                    sectors.push(preload);
+                }
+            }
+            for (let i = 0; i < this.preloadQueue.length; ++i) {
+                if (this.preloadQueue[i] == sector) {
+                    this.preloadQueue.splice(i, 1);
+                    break;
+                }
             }
         }
         return {
