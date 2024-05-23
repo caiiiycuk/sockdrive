@@ -24,11 +24,11 @@ export class Drive {
     request: Request | null;
     pendingRequest: Request | null;
 
-    aheadRange: number;
-    aheadSize: number;
+    aheadRange: number = 0;
+    aheadSize: number = 0;
     writeBuffer: Uint8Array;
 
-    maxRead: number;
+    maxRead: number = 0;
     readBuffer: Uint8Array = new Uint8Array(0);
     readAheadBuffer: Uint8Array = new Uint8Array(0);
     readAheadPos = 0;
@@ -36,7 +36,7 @@ export class Drive {
     readStartedAt: number = 0;
     decodeBuffer: Uint8Array = new Uint8Array(0);
 
-    cache: Cache;
+    cache: Cache | null = null;
     cleanup = () => {/**/};
 
     openFn = (read: boolean, write: boolean, size: number, preloadQueue: number[]) => {/**/};
@@ -46,7 +46,7 @@ export class Drive {
     retries: number;
 
     preloadSectors: boolean;
-    preloadQueue: number[];
+    preloadQueue: number[] = [];
 
     public constructor(endpoint: string,
         owner: string,
@@ -147,7 +147,7 @@ export class Drive {
                                         this.preloadQueue = this.preloadQueue
                                             .slice(0, Math.floor(MEMORY_LIMIT / this.aheadSize));
                                     }
-                                    this.request = this.makeReadRequest(this.preloadQueue.shift());
+                                    this.request = this.makeReadRequest(this.preloadQueue.shift()!);
                                     this.executeRequest(this.request);
                                 }
                             }
@@ -195,7 +195,7 @@ export class Drive {
         if (this.preloadQueue.length > 0) {
             this.preloadProgressFn(this.preloadQueue.length * this.aheadSize);
             while (this.preloadQueue.length > 0 && sectors.length < this.maxRead) {
-                const preload = this.preloadQueue.shift();
+                const preload = this.preloadQueue.shift()!;
                 if (preload !== sector) {
                     sectors.push(preload);
                 }
@@ -216,7 +216,7 @@ export class Drive {
     }
 
     public read(sector: number, buffer: Ptr, sync: boolean): Promise<number> | number {
-        const cached = this.cache.read(sector);
+        const cached = this.cache!.read(sector);
         if (cached !== null) {
             if (sync) {
                 this.stats.cacheHit++;
@@ -252,7 +252,7 @@ export class Drive {
             buffer: this.module.HEAPU8.slice(buffer, buffer + this.sectorSize),
             resolve: () => {/**/},
         };
-        this.cache.write(sector, request.buffer as Uint8Array);
+        this.cache!.write(sector, request.buffer as Uint8Array);
         this.executeRequest(request);
         return 0;
     }
@@ -285,7 +285,7 @@ export class Drive {
                 this.readBuffer[4] = (sectors.length >> 24) & 0xFF;
 
                 for (let i = 0; i < sectors.length; ++i) {
-                    const origin = this.cache.getOrigin(sectors[i]);
+                    const origin = this.cache!.getOrigin(sectors[i]);
 
                     if (i > 0 && origin !== sectors[i]) {
                         console.error("Assertion failed orign should equal to sector", origin, sectors[i]);
@@ -357,8 +357,8 @@ export class Drive {
                         for (let i = 0; i < sectors.length; ++i) {
                             const aheadOffset = i * this.aheadSize;
                             const sector = sectors[i];
-                            const origin = this.cache.getOrigin(sector);
-                            this.cache.create(origin,
+                            const origin = this.cache!.getOrigin(sector);
+                            this.cache!.create(origin,
                                 this.readAheadBuffer.slice(aheadOffset, aheadOffset + this.aheadSize));
                             if (i == 0 && buffer as number >= 0) {
                                 const offset = sector - origin;
@@ -368,7 +368,7 @@ export class Drive {
                             }
                         }
 
-                        this.stats.cacheUsed = this.cache.memUsed();
+                        this.stats.cacheUsed = this.cache!.memUsed();
                         this.stats.read += this.readAheadCompressed;
                         this.stats.readTotalTime += Date.now() - this.readStartedAt;
                         this.request = null;
@@ -379,7 +379,7 @@ export class Drive {
                             this.pendingRequest = null;
                             this.executeRequest(this.request);
                         } else if (this.preloadQueue.length > 0) {
-                            this.request = this.makeReadRequest(this.preloadQueue.shift());
+                            this.request = this.makeReadRequest(this.preloadQueue.shift()!);
                             this.executeRequest(this.request);
                         }
                     }
