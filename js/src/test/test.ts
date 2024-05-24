@@ -182,14 +182,17 @@ async function runTests() {
         assert.equal(await drive.read(0, 0, false), 0);
         assert.deepEqual(module.HEAPU8.slice(0, 10), new Uint8Array([51, 192, 142, 208, 188, 0, 124, 251, 80, 7]));
         assert.equal(1, stats.cacheMiss, "cache miss");
+        assert.equal(0, stats.cacheHit, "cache hit");
 
         assert.equal(await drive.read(8192, 0, false), 0);
         assert.deepEqual(module.HEAPU8.slice(0, 10), new Uint8Array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
         assert.equal(2, stats.cacheMiss, "cache miss");
+        assert.equal(0, stats.cacheHit, "cache hit");
 
         assert.equal(await drive.read(8448, 0, false), 0);
         assert.deepEqual(module.HEAPU8.slice(256, 256 + 10), new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]));
-        assert.equal(3, stats.cacheMiss, "cache miss");
+        assert.equal(2, stats.cacheMiss, "cache miss");
+        assert.equal(1, stats.cacheHit, "cache hit");
     });
 
     testDrive("read cache", async (drive, module, stats) => {
@@ -213,16 +216,14 @@ async function runTests() {
     });
 
     testDrive("preload sectors", async (drive, module, stats, preloadQueue) => {
-        assert.ok(preloadQueue.length >= 3);
+        assert.ok(preloadQueue.length >= 2);
         let _0 = false;
-        let _8448 = false;
         let _8192 = false;
         for (const next of preloadQueue) {
             _0 = _0 || next === 0;
             _8192 = _8192 || next === 8192;
-            _8448 = _8448 || next === 8448;
         }
-        assert.ok(_0 && _8192 && _8448);
+        assert.ok(_0 && _8192);
 
         await new Promise<void>((resolve) => setTimeout(resolve, 1000));
 

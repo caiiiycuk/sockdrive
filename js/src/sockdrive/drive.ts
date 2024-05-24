@@ -39,7 +39,8 @@ export class Drive {
     cache: Cache | null = null;
     cleanup = () => {/**/};
 
-    openFn = (read: boolean, write: boolean, size: number, preloadQueue: number[]) => {/**/};
+    openFn = (read: boolean, write: boolean, size: number, preloadQueue: number[],
+        aheadRange: number) => {/**/};
     preloadProgressFn = (restBytes: number) => {/**/};
     errorFn = (e: Error) => {/**/};
 
@@ -48,13 +49,16 @@ export class Drive {
     preloadSectors: boolean;
     preloadQueue: number[] = [];
 
+    originReadMode: boolean;
+
     public constructor(endpoint: string,
         owner: string,
         drive: string,
         token: string,
         stats: Stats,
         module: EmModule,
-        preloadSectors = true) {
+        preloadSectors = true,
+        originReadMode = false) {
         this.sectorSize = 512;
         this.module = module;
         this.endpoint = endpoint;
@@ -67,6 +71,7 @@ export class Drive {
         this.stats = stats;
         this.retries = 3;
         this.preloadSectors = preloadSectors;
+        this.originReadMode = originReadMode;
 
         this.reconnect();
     }
@@ -75,7 +80,8 @@ export class Drive {
         this.errorFn = errorFn;
     }
 
-    public onOpen(openFn: (read: boolean, write: boolean, imageSize: number, preloadQueue: number[]) => void) {
+    public onOpen(openFn: (read: boolean, write: boolean, imageSize: number,
+        preloadQueue: number[], aheadRange: number) => void) {
         this.openFn = openFn;
     }
 
@@ -136,7 +142,8 @@ export class Drive {
                                 socket.addEventListener("message", onMessage);
                                 this.openFn(true, mode === "write",
                                     (Number.parseInt(sizeStr) ?? 2 * 1024 * 1024) * 1024,
-                                    this.preloadQueue);
+                                    this.preloadQueue,
+                                    aheadRange);
                                 resolve(socket);
 
                                 if (this.preloadQueue.length > 0) {
@@ -216,11 +223,9 @@ export class Drive {
     }
 
     public read(sector: number, buffer: Ptr, sync: boolean): Promise<number> | number {
-        const cached = this.cache!.read(sector);
+        const cached = this.cache!.read(sector, this.originReadMode);
         if (cached !== null) {
-            if (sync) {
-                this.stats.cacheHit++;
-            }
+            this.stats.cacheHit++;
             this.module.HEAPU8.set(cached, buffer);
             return sync ? 0 : Promise.resolve(0);
         } else if (sync) {
@@ -361,10 +366,15 @@ export class Drive {
                             this.cache!.create(origin,
                                 this.readAheadBuffer.slice(aheadOffset, aheadOffset + this.aheadSize));
                             if (i == 0 && buffer as number >= 0) {
+                                if (this.originReadMode && sector !== origin) {
+                                    throw new Error("Sector must be one of origins in originReadMode");
+                                }
                                 const offset = sector - origin;
                                 // aheadOffset is zero
-                                this.module.HEAPU8.set(this.readAheadBuffer.slice(offset * this.sectorSize,
-                                    (offset + 1) * this.sectorSize), buffer as number);
+                                const from = offset * this.sectorSize;
+                                this.module.HEAPU8.set(this.readAheadBuffer
+                                    .slice(from, from + (this.originReadMode ? this.aheadRange : 1) * this.sectorSize),
+                                    buffer as number);
                             }
                         }
 
