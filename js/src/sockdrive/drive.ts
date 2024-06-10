@@ -50,6 +50,7 @@ export class Drive {
     preloadQueue: number[] = [];
 
     originReadMode: boolean;
+    readOnly = false;
 
     public constructor(endpoint: string,
         owner: string,
@@ -140,7 +141,8 @@ export class Drive {
                                 }
                                 socket.removeEventListener("message", onPreloadMessage);
                                 socket.addEventListener("message", onMessage);
-                                this.openFn(true, mode === "write",
+                                this.readOnly = mode !== "write";
+                                this.openFn(true, !this.readOnly,
                                     (Number.parseInt(sizeStr) ?? 2 * 1024 * 1024) * 1024,
                                     this.preloadQueue,
                                     aheadRange);
@@ -304,6 +306,8 @@ export class Drive {
                     this.readBuffer[5 + i * 4 + 3] = (origin >> 24) & 0xFF;
                 }
                 socket.send(this.readBuffer.slice(0, sectors.length * 4 + 5).buffer);
+            } else if (this.readOnly) {
+                request.resolve(0);
             } else {
                 const { sectors, buffer, resolve } = request;
                 this.stats.write += this.sectorSize;
