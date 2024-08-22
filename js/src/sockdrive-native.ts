@@ -23,6 +23,7 @@ declare const Module: EmModule & any;
         cacheHit: 0,
         cacheMiss: 0,
         cacheUsed: 0,
+        io: [],
     };
     Module.sockdrive = {
         stats,
@@ -44,6 +45,7 @@ declare const Module: EmModule & any;
             }
             seq++;
             templates[seq] = template;
+            stats.io.push({ read: 0, write: 0 });
             return new Promise<Handle>((resolve, reject) => {
                 mapping[seq] = new Drive(url, owner, name, token, stats, Module);
                 mapping[seq].onOpen((read, write, imageSize, preloadQueue) => {
@@ -61,6 +63,7 @@ declare const Module: EmModule & any;
         },
         read: (handle: Handle, sector: number, buffer: Ptr, sync: boolean): Promise<number> | number => {
             if (mapping[handle]) {
+                stats.io[handle].read += 1;
                 return mapping[handle].read(sector, buffer, sync);
             }
 
@@ -69,6 +72,7 @@ declare const Module: EmModule & any;
         },
         write: (handle: Handle, sector: number, buffer: Ptr): number => {
             if (mapping[handle]) {
+                stats.io[handle].write += 1;
                 return mapping[handle].write(sector, buffer);
             }
             console.error("ERROR! sockdrive handle", handle, "not found");

@@ -156,6 +156,7 @@ async function runTests() {
                 cacheHit: 0,
                 cacheMiss: 0,
                 cacheUsed: 0,
+                io: [],
             };
 
             const drive = new Drive("ws://127.0.0.1:8001", "system", "test", "", stats, module, preload);

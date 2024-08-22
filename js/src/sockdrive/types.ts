@@ -7,6 +7,10 @@ export interface Stats {
     cacheHit: number,
     cacheMiss: number,
     cacheUsed: number,
+    io: {
+        read: number,
+        write: number,
+    }[],
 };
 
 export interface EmModule {

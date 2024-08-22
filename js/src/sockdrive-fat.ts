@@ -154,6 +154,7 @@ export async function createSockdriveFileSystem(endpoint: string,
         cacheHit: 0,
         cacheMiss: 0,
         cacheUsed: 0,
+        io: [],
     };
 
     const sectorSize = 512;
