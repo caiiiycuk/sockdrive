@@ -63,7 +63,7 @@ declare const Module: EmModule & any;
         },
         read: (handle: Handle, sector: number, buffer: Ptr, sync: boolean): Promise<number> | number => {
             if (mapping[handle]) {
-                stats.io[handle].read += 1;
+                stats.io[handle - 1].read += 1;
                 return mapping[handle].read(sector, buffer, sync);
             }
 
@@ -72,7 +72,7 @@ declare const Module: EmModule & any;
         },
         write: (handle: Handle, sector: number, buffer: Ptr): number => {
             if (mapping[handle]) {
-                stats.io[handle].write += 1;
+                stats.io[handle - 1].write += 1;
                 return mapping[handle].write(sector, buffer);
             }
             console.error("ERROR! sockdrive handle", handle, "not found");
