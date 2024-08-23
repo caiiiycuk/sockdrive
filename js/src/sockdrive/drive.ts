@@ -3,12 +3,17 @@ import { BlockCache, Cache } from "./cache";
 
 const MAX_FRAME_SIZE = 1 * 1024 * 1024;
 const MEMORY_LIMIT = 64 * 1024 * 1024;
+const preloadPriority: Drive[] = [];
 
 interface Request {
     type: 1 | 2, // read | write
     sectors: number[],
     buffer: Ptr | Uint8Array,
     resolve: (result: number) => void,
+}
+
+export function getPreloadPriority() {
+    return preloadPriority;
 }
 
 export class Drive {
@@ -138,6 +143,7 @@ export class Drive {
                                         this.preloadQueue.push(preload[i] + (preload[i + 1] << 8) +
                                             (preload[i + 2] << 16) + (preload[i + 3] << 24));
                                     }
+                                    preloadPriority.push(this);
                                 }
                                 socket.removeEventListener("message", onPreloadMessage);
                                 socket.addEventListener("message", onMessage);
@@ -156,8 +162,8 @@ export class Drive {
                                         this.preloadQueue = this.preloadQueue
                                             .slice(0, Math.floor(MEMORY_LIMIT / this.aheadSize));
                                     }
-                                    this.request = this.makeReadRequest(this.preloadQueue.shift()!);
-                                    this.executeRequest(this.request);
+
+                                    this.makePreloadRequest();
                                 }
                             }
                         };
@@ -169,6 +175,14 @@ export class Drive {
                     }
                 };
                 socket.addEventListener("message", onInit);
+                socket.addEventListener("close", () => {
+                    for (let i = 0; i < preloadPriority.length; ++i) {
+                        if (preloadPriority[i] === this) {
+                            preloadPriority.splice(i, 1);
+                            break;
+                        }
+                    }
+                });
                 socket.send(this.owner + "&" + this.drive + "&" + this.token);
             };
             const onError = (e: Event) => {
@@ -199,20 +213,41 @@ export class Drive {
         }
     }
 
+    private makePreloadRequest() {
+        if (this.pendingRequest === null && this.preloadQueue.length > 0 &&
+            preloadPriority.length > 0 && preloadPriority[0] === this) {
+            this.request = this.makeReadRequest(this.preloadQueue.shift()!);
+            this.executeRequest(this.request);
+        }
+    }
+
     private makeReadRequest(sector: number, buffer: number = -1, resolve: (res: number) => void = () => { }): Request {
         const sectors: number[] = [sector];
         if (this.preloadQueue.length > 0) {
-            this.preloadProgressFn(this.preloadQueue.length * this.aheadSize);
-            while (this.preloadQueue.length > 0 && sectors.length < this.maxRead) {
-                const preload = this.preloadQueue.shift()!;
-                if (preload !== sector) {
-                    sectors.push(preload);
+            if (preloadPriority[0] === this) {
+                this.preloadProgressFn(this.preloadQueue.length * this.aheadSize);
+                while (this.preloadQueue.length > 0 && sectors.length < this.maxRead) {
+                    const preload = this.preloadQueue.shift()!;
+                    if (preload !== sector) {
+                        sectors.push(preload);
+                    }
                 }
             }
             for (let i = 0; i < this.preloadQueue.length; ++i) {
                 if (this.preloadQueue[i] == sector) {
                     this.preloadQueue.splice(i, 1);
                     break;
+                }
+            }
+            if (this.preloadQueue.length === 0) {
+                for (let i = 0; i < preloadPriority.length; ++i) {
+                    if (preloadPriority[i] === this) {
+                        preloadPriority.splice(i, 1);
+                        break;
+                    }
+                }
+                if (preloadPriority.length > 0) {
+                    preloadPriority[0].makePreloadRequest();
                 }
             }
         }
@@ -392,9 +427,8 @@ export class Drive {
                             this.request = this.pendingRequest;
                             this.pendingRequest = null;
                             this.executeRequest(this.request);
-                        } else if (this.preloadQueue.length > 0) {
-                            this.request = this.makeReadRequest(this.preloadQueue.shift()!);
-                            this.executeRequest(this.request);
+                        } else {
+                            this.makePreloadRequest();
                         }
                     }
                 }

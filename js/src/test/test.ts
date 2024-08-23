@@ -1,5 +1,5 @@
 import { FileSystem, FileSystemApi, CreateFileSystemApi, Driver, CreateSockdriveFileSystem } from "../sockdrive-fat";
-import { Drive } from "../sockdrive/drive";
+import { Drive, getPreloadPriority } from "../sockdrive/drive";
 import { EmModule, Stats } from "../sockdrive/types";
 
 declare const createFileSystem: CreateFileSystemApi;
@@ -176,6 +176,7 @@ async function runTests() {
 
             await fn(drive, module, stats, preloadQueue);
             await drive.close();
+            assert.equal(getPreloadPriority().length, 0);
         });
     };
 
