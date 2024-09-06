@@ -242,6 +242,17 @@ async function runTests() {
         assert.equal(0, stats.cacheMiss, "cache miss");
     }, true);
 
+    testDrive("recovery from socket close", async (drive, module, stats, preloadQueue) => {
+        const socket = await drive.currentSocket();
+        assert.ok(socket != null);
+        assert.equal(await drive.read(0, 0, false), 0);
+        assert.deepEqual(module.HEAPU8.slice(0, 10), new Uint8Array([51, 192, 142, 208, 188, 0, 124, 251, 80, 7]));
+
+        socket.close();
+        assert.equal(await drive.read(8448, 0, false), 0);
+        assert.deepEqual(module.HEAPU8.slice(256, 256 + 10), new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]));
+    });
+
     suite("sockdrive 127.0.0.1:8001");
 
     test("error on wrong drive name", (done) => {

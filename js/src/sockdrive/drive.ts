@@ -49,13 +49,12 @@ export class Drive {
     preloadProgressFn = (restBytes: number) => {/**/};
     errorFn = (e: Error) => {/**/};
 
-    retries: number;
-
     preloadSectors: boolean;
     preloadQueue: number[] = [];
 
     originReadMode: boolean;
     readOnly = false;
+    alive = true;
 
     public constructor(endpoint: string,
         owner: string,
@@ -75,7 +74,6 @@ export class Drive {
         this.pendingRequest = null;
         this.writeBuffer = new Uint8Array(1 + 4 + this.sectorSize);
         this.stats = stats;
-        this.retries = 3;
         this.preloadSectors = preloadSectors;
         this.originReadMode = originReadMode;
 
@@ -96,6 +94,10 @@ export class Drive {
     }
 
     public reconnect(): void {
+        if (!this.alive) {
+            return;
+        }
+
         this.socket = new Promise<WebSocket>((resolve, reject) => {
             const socket = new WebSocket(this.endpoint);
             socket.binaryType = "arraybuffer";
@@ -152,6 +154,10 @@ export class Drive {
                                     (Number.parseInt(sizeStr) ?? 2 * 1024 * 1024) * 1024,
                                     this.preloadQueue,
                                     aheadRange);
+
+                                this.onOpen = () => {};
+                                this.errorFn = () => {};
+                                this.preloadSectors = false;
                                 resolve(socket);
 
                                 if (this.preloadQueue.length > 0) {
@@ -189,14 +195,7 @@ export class Drive {
                 console.error("Network error", e, "will reconnect");
                 cleanup();
                 socket.close();
-                this.retries--;
-                if (this.retries === 0) {
-                    const error = new Error("Network problem");
-                    this.errorFn(error);
-                    reject(error);
-                } else {
-                    setTimeout(this.reconnect.bind(this), 300);
-                }
+                setTimeout(this.reconnect.bind(this), 300);
             };
             socket.addEventListener("error", onError);
             socket.addEventListener("open", onOpen);
@@ -300,6 +299,7 @@ export class Drive {
     }
 
     public async close() {
+        this.alive = false;
         const socket = await this.socket;
         await new Promise<void>((resolve) => {
             const intervalId = setInterval(() => {
@@ -314,7 +314,21 @@ export class Drive {
     }
 
     private executeRequest(request: Request) {
-        this.socket.then((socket) => {
+        this.socket.then(async (socket) => {
+            if (socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING) {
+                if (!this.alive) {
+                    console.error("Trying to read from closed drive", this.drive);
+                    request.resolve(4);
+                    return;
+                } else {
+                    console.error("Drive connection to '" + this.owner + "/" + this.drive +
+                        "' was closed, trying to reconnect...");
+                    this.preloadQueue = [];
+                    this.reconnect();
+                    socket = await this.socket;
+                }
+            }
+
             if (request.type === 1) {
                 const { sectors } = request;
                 this.readStartedAt = Date.now();
@@ -356,7 +370,7 @@ export class Drive {
                 socket.send(this.writeBuffer.buffer);
                 resolve(0);
             }
-        });
+        }).catch(console.error);
     }
 
     public onMessage(event: { data: ArrayBuffer }) {
@@ -437,6 +451,10 @@ export class Drive {
             console.error("Received non arraybuffer data");
             this.reconnect();
         }
+    }
+
+    public currentSocket() {
+        return this.socket;
     }
 }
 
