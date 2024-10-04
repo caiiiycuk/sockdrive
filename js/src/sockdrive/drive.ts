@@ -213,7 +213,7 @@ export class Drive {
     }
 
     private makePreloadRequest() {
-        if (this.pendingRequest === null && this.preloadQueue.length > 0 &&
+        if (this.request === null && this.preloadQueue.length > 0 &&
             preloadPriority.length > 0 && preloadPriority[0] === this) {
             this.request = this.makeReadRequest(this.preloadQueue.shift()!);
             this.executeRequest(this.request);
@@ -239,13 +239,14 @@ export class Drive {
                 }
             }
             if (this.preloadQueue.length === 0) {
-                for (let i = 0; i < preloadPriority.length; ++i) {
+                let i = 0;
+                for (;i < preloadPriority.length; ++i) {
                     if (preloadPriority[i] === this) {
                         preloadPriority.splice(i, 1);
                         break;
                     }
                 }
-                if (preloadPriority.length > 0) {
+                if (i == 0 && preloadPriority.length > 0) {
                     preloadPriority[0].makePreloadRequest();
                 }
             }
