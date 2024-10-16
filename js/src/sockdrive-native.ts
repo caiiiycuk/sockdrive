@@ -1,5 +1,6 @@
 import { EmModule, Handle, Ptr, Stats } from "./sockdrive/types";
 import { Drive } from "./sockdrive/drive";
+import { Cache } from "./sockdrive/cache";
 
 interface Template {
     name: string,
@@ -25,15 +26,14 @@ declare const Module: EmModule & any;
         cacheUsed: 0,
         io: [],
     };
+    const cache: { [backend: string]: Cache } = {};
     Module.sockdrive = {
         stats,
+        cache,
         onError: (e: Error) => {
             console.error(e);
         },
         onOpen: (drive: string, read: boolean, write: boolean) => {
-            // noop
-        },
-        onPreloadProgress: (dirve: string, restBytes: number) => {
             // noop
         },
         open: async (url: string, owner: string, name: string, token: string): Promise<Handle> => {
@@ -47,7 +47,13 @@ declare const Module: EmModule & any;
             templates[seq] = template;
             stats.io.push({ read: 0, write: 0 });
             return new Promise<Handle>((resolve, reject) => {
-                mapping[seq] = new Drive(url, owner, name, token, stats, Module);
+                const backendCache = cache[url] ?? null;
+                if (backendCache) {
+                    backendCache.open(owner, name, token);
+                } else {
+                    console.error("sockdrive cache not found for", url);
+                }
+                mapping[seq] = new Drive(url, owner, name, token, stats, Module, backendCache);
                 mapping[seq].onOpen((read, write, imageSize, preloadQueue) => {
                     Module.sockdrive.onOpen(owner + "/" + name, read, write, imageSize, preloadQueue);
                     resolve(seq);
@@ -55,9 +61,6 @@ declare const Module: EmModule & any;
                 mapping[seq].onError((e) => {
                     Module.sockdrive.onError(e);
                     reject(e);
-                });
-                mapping[seq].onPreloadProgress((restBytes) => {
-                    Module.sockdrive.onPreloadProgress(owner + "/" + name, restBytes);
                 });
             });
         },
@@ -80,7 +83,6 @@ declare const Module: EmModule & any;
         },
         close: (handle: Handle) => {
             if (mapping[handle]) {
-                Module._free(mapping[handle].readAheadBuffer);
                 mapping[handle].close();
                 delete mapping[handle];
             }
