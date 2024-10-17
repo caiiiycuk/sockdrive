@@ -30,6 +30,9 @@ declare const Module: EmModule & any;
     Module.sockdrive = {
         stats,
         cache,
+        createCache: (url: string, preload: boolean) => {
+            return new Cache(url, preload);
+        },
         onError: (e: Error) => {
             console.error(e);
         },
