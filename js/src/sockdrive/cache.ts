@@ -21,6 +21,10 @@ class BlockCache {
         this.lru = new LRUMap(Math.floor(memoryLimit / (aheadRange * sectorSize)));
     }
 
+    contains(origin: number): boolean {
+        return !!this.lru.get(origin);
+    }
+
     public read(sector: number): Uint8Array | null {
         const origin = this.getOrigin(sector);
         const cached = this.lru.get(origin) as Uint8Array;
@@ -46,9 +50,9 @@ class BlockCache {
 
 class WsCache {
     cache: BlockCache | null = null;
+    writeCache: {[sector: number]: Uint8Array} = {};
     socket: WebSocket | null = null;
     connect: () => Promise<void>;
-
 
     constructor(url: string, owner: string, drive: string, token: string, preload: boolean,
         progress: ProgressFn, payload: PayloadFn) {
@@ -124,8 +128,10 @@ class WsCache {
                                                     count -= frame.sectors.length;
                                                     progress(owner, drive, rest, total);
                                                     for (let i = 0; i < frame.sectors.length; ++i) {
-                                                        this.cache?.create(frame.sectors[i],
-                                                            frame.sectorsRow, i * frame.aheadSize);
+                                                        if (!this.cache?.contains(frame.sectors[i])) {
+                                                            this.cache?.create(frame.sectors[i],
+                                                                frame.sectorsRow, i * frame.aheadSize);
+                                                        }
                                                     }
                                                     frame.sectors = [];
                                                     frame.payloadSize = 0;
@@ -152,7 +158,11 @@ class WsCache {
     }
 
     public read(sector: number): Uint8Array | null {
-        return this.cache?.read(sector) ?? null;
+        return this.writeCache[sector] ?? this.cache?.read(sector) ?? null;
+    }
+
+    public write(sector: number, buffer: Uint8Array): void {
+        this.writeCache[sector] = buffer;
     }
 
     public create(origin: number, buffer: Uint8Array, from: number) {
@@ -235,6 +245,15 @@ export class Cache {
                 throw new Error("Origin mistamtch for " + key);
             }
             this.impl[key].create(origin, buffer, from);
+        } else {
+            console.error("Cache for drive", key, "not opened!");
+        }
+    }
+
+    write(owner: string, drive: string, sector: number, buffer: Uint8Array): void {
+        const key = this.key(owner, drive);
+        if (this.impl[key]) {
+            this.impl[key].write(sector, buffer);
         } else {
             console.error("Cache for drive", key, "not opened!");
         }

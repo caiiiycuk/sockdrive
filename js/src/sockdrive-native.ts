@@ -105,5 +105,12 @@ declare const Module: EmModule & any;
         sectors: (handle: Handle) => {
             return templates[handle]?.sectors ?? 63;
         },
+        bufferedAmount: () => {
+            let total = 0;
+            for (const next of Object.values(mapping)) {
+                total += next.bufferedAmount();
+            }
+            return total;
+        },
     };
 })();

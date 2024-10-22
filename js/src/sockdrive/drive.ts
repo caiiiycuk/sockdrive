@@ -32,7 +32,6 @@ export class Drive {
     readStartedAt: number = 0;
 
     cache: Cache | null;
-    writeCache: {[sector: number]: Uint8Array} = {};
     cleanup = () => {/**/};
 
     openFn = (read: boolean, write: boolean, size: number, aheadRange: number) => {/**/};
@@ -40,6 +39,7 @@ export class Drive {
 
     readOnly = false;
     alive = true;
+    lastBufferedAmount = 0;
 
     public constructor(endpoint: string,
         owner: string,
@@ -152,7 +152,7 @@ export class Drive {
     }
 
     public read(sector: number, buffer: Ptr, sync: boolean): Promise<number> | number {
-        const cached = this.writeCache[sector] ?? this.cache?.read(this.owner, this.drive, sector);
+        const cached = this.cache?.read(this.owner, this.drive, sector);
         if (cached) {
             this.stats.cacheHit++;
             this.module.HEAPU8.set(this.readBuffered || cached.length == this.sectorSize ? cached :
@@ -189,7 +189,8 @@ export class Drive {
             buffer: this.module.HEAPU8.slice(buffer, buffer + this.sectorSize),
             resolve: () => {/**/},
         };
-        this.writeCache[sector] = (request.buffer as Uint8Array).slice(0, this.sectorSize);
+        this.lastBufferedAmount += this.sectorSize;
+        this.cache?.write(this.owner, this.drive, sector, request.buffer as Uint8Array);
         this.executeRequest(request);
         return 0;
     }
@@ -301,5 +302,14 @@ export class Drive {
 
     public getOrigin(sector: number) {
         return sector - sector % this.aheadRange;
+    }
+
+    public bufferedAmount(): number {
+        this.socket.then((s) => {
+            if (s) {
+                this.lastBufferedAmount = s.bufferedAmount;
+            }
+        });
+        return this.lastBufferedAmount;
     }
 }
