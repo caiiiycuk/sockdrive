@@ -44,7 +44,7 @@ export class Drive {
     alive = true;
     lastBufferedAmount = 0;
 
-    statsDirty: {[sector: number]: number} = {};
+    statsDirty: { [sector: number]: number } = {};
     statsCommitInterval: number;
 
     public constructor(endpoint: string,
@@ -75,8 +75,12 @@ export class Drive {
 
         this.statsCommitInterval = setInterval(() => {
             if (Object.keys(this.statsDirty).length > 0) {
-                fetch("https://d5dn8hh4ivlobv6682ep.apigw.yandexcloud.net/sockdrive/cache/set?drive=" +
-                        this.realDrive + "&owner=" + this.realOwner + "&client=" + token, {
+                fetch("https://d5dn8hh4ivlobv6682ep.apigw.yandexcloud.net/sockdrive/cache/set" +
+                    "?endpoint=" + encodeURIComponent(this.endpoint) +
+                    "&drive=" + encodeURIComponent(this.realDrive) +
+                    "&owner=" + encodeURIComponent(this.realOwner) +
+                    "&client=" + token,
+                {
                     method: "POST",
                     body: JSON.stringify(this.statsDirty),
                 }).catch((e) => console.warn("Can't send drive cache stats", e));
