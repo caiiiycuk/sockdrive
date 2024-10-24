@@ -15,6 +15,8 @@ export class Drive {
     endpoint: string;
     owner: string;
     drive: string;
+    realOwner: string;
+    realDrive: string;
     token: string;
     stats: Stats;
 
@@ -34,12 +36,16 @@ export class Drive {
     cache: Cache | null;
     cleanup = () => {/**/};
 
-    openFn = (read: boolean, write: boolean, size: number, aheadRange: number) => {/**/};
+    openFn = (read: boolean, write: boolean, size: number, aheadRange: number,
+        realOwner: string, realName: string) => {/**/};
     errorFn = (e: Error) => {/**/};
 
     readOnly = false;
     alive = true;
     lastBufferedAmount = 0;
+
+    statsDirty: {[sector: number]: number} = {};
+    statsCommitInterval: number;
 
     public constructor(endpoint: string,
         owner: string,
@@ -54,6 +60,8 @@ export class Drive {
         this.endpoint = endpoint;
         this.owner = owner;
         this.drive = drive;
+        this.realOwner = owner;
+        this.realDrive = drive;
         this.token = token;
         this.request = null;
         this.readBuffer = new Uint8Array(1 + 4 + 4);
@@ -64,13 +72,25 @@ export class Drive {
         this.frame = null as any;
         this.readBuffered = readBuffered;
         this.reconnect();
+
+        this.statsCommitInterval = setInterval(() => {
+            if (Object.keys(this.statsDirty).length > 0) {
+                fetch("https://d5dn8hh4ivlobv6682ep.apigw.yandexcloud.net/sockdrive/cache/set?drive=" +
+                        this.realDrive + "&owner=" + this.realOwner + "&client=" + token, {
+                    method: "POST",
+                    body: JSON.stringify(this.statsDirty),
+                }).catch((e) => console.warn("Can't send drive cache stats", e));
+                this.statsDirty = {};
+            }
+        }, 1000 * 60) as any;
     }
 
     public onError(errorFn: (e: Error) => void) {
         this.errorFn = errorFn;
     }
 
-    public onOpen(openFn: (read: boolean, write: boolean, imageSize: number, aheadRange: number) => void) {
+    public onOpen(openFn: (read: boolean, write: boolean, imageSize: number, aheadRange: number,
+        realOwner: string, realName: string) => void) {
         this.openFn = openFn;
     }
 
@@ -95,7 +115,9 @@ export class Drive {
                 const onInit = (event: { data: string }) => {
                     socket.removeEventListener("message", onInit);
                     if (event.data.startsWith("write") || event.data.startsWith("read")) {
-                        const [mode, aheadRangeStr, sizeStr] = event.data.split(",");
+                        const [mode, aheadRangeStr, sizeStr, realOwner, realDrive] = event.data.split(",");
+                        this.realOwner = realOwner;
+                        this.realDrive = realDrive;
                         this.aheadRange = Number.parseInt(aheadRangeStr);
                         this.aheadSize = this.aheadRange * this.sectorSize;
                         this.readOnly = mode !== "write";
@@ -114,7 +136,7 @@ export class Drive {
                             socket.addEventListener("message", onMessage);
                             this.openFn(true, !this.readOnly,
                                 (Number.parseInt(sizeStr) ?? 2 * 1024 * 1024) * 1024,
-                                this.aheadRange);
+                                this.aheadRange, realOwner, realDrive);
 
                             this.onOpen = () => { };
                             this.errorFn = () => { };
@@ -152,6 +174,9 @@ export class Drive {
     }
 
     public read(sector: number, buffer: Ptr, sync: boolean): Promise<number> | number {
+        const origin = this.getOrigin(sector);
+        this.statsDirty[origin] = (this.statsDirty[origin] ?? 0) + 1;
+
         const cached = this.cache?.read(this.owner, this.drive, sector);
         if (cached) {
             this.stats.cacheHit++;
@@ -196,6 +221,7 @@ export class Drive {
     }
 
     public async close() {
+        clearInterval(this.statsCommitInterval);
         this.alive = false;
         const socket = await this.socket;
         await new Promise<void>((resolve) => {

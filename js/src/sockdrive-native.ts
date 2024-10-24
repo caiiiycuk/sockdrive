@@ -57,8 +57,9 @@ declare const Module: EmModule & any;
                     console.error("sockdrive cache not found for", url);
                 }
                 mapping[seq] = new Drive(url, owner, name, token, stats, Module, backendCache);
-                mapping[seq].onOpen((read, write, imageSize, preloadQueue) => {
-                    Module.sockdrive.onOpen(owner + "/" + name, read, write, imageSize, preloadQueue);
+                mapping[seq].onOpen((read, write, imageSize, preloadQueue, realOwner, realName) => {
+                    Module.sockdrive.onOpen((realOwner ?? owner) + "/" + (realName ?? name),
+                        read, write, imageSize, preloadQueue);
                     resolve(seq);
                 });
                 mapping[seq].onError((e) => {
