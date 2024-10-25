@@ -75,13 +75,15 @@ export class Drive {
 
         this.statsCommitInterval = setInterval(() => {
             if (Object.keys(this.statsDirty).length > 0) {
-                fetch("https://d5dn8hh4ivlobv6682ep.apigw.yandexcloud.net/sockdrive/cache/set" +
-                    "?endpoint=" + encodeURIComponent(this.endpoint) +
-                    "&drive=" + encodeURIComponent(this.realDrive) +
-                    "&owner=" + encodeURIComponent(this.realOwner) +
-                    "&client=" + token,
+                fetch(endpoint.replace("wss://", "https://").replace("ws://", "http://") + "/cache/set" +
+                    "/" + encodeURIComponent(this.realOwner) +
+                    "/" + encodeURIComponent(this.realDrive) +
+                    "/" + (token.length === 0 ? "guest" : token),
                 {
                     method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                    },
                     body: JSON.stringify(this.statsDirty),
                 }).catch((e) => console.warn("Can't send drive cache stats", e));
                 this.statsDirty = {};
