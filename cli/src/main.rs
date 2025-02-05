@@ -96,21 +96,46 @@ fn brotli_all(output_dir: &str) {
     let total = chunks.len();
     println!("Compressing {} files on {} CPUs", files.len(), num_cpus);
     chunks.enumerate().for_each(|(i, chunk)| {
-        let handles: Vec<_> = chunk.iter().map(|file| {
-            let path = file.path();
-            std::thread::spawn(move || {
-                let status = Command::new("brotli")
-                    .arg("-Zj")
-                    .arg(&path)
-                    .status()
-                    .unwrap();
+        let handles: Vec<_> = chunk
+            .iter()
+            .map(|file| {
+                let path = file.path();
+                std::thread::spawn(move || {
+                    let status = Command::new("brotli")
+                        .arg("-Z")
+                        .arg(&path)
+                        .status()
+                        .unwrap();
 
-                if !status.success() {
-                    eprintln!("Failed to compress {:?}", path);
-                    std::process::exit(1);
-                }
+                    if !status.success() {
+                        eprintln!("Failed to compress {:?}", path);
+                        std::process::exit(1);
+                    }
+
+                    let br_path = path.with_extension("raw.br");
+                    let orig_size = std::fs::metadata(&path).unwrap().len();
+                    let br_size = std::fs::metadata(&br_path).unwrap().len();
+
+                    if br_size < orig_size {
+                        std::fs::rename(br_path, path).unwrap();
+                    } else {
+                        std::fs::remove_file(&br_path).unwrap();
+                        let status = Command::new("brotli")
+                            .arg("-0")
+                            .arg(&path)
+                            .status()
+                            .unwrap();
+
+                        if !status.success() {
+                            eprintln!("Failed to compress {:?}", path);
+                            std::process::exit(1);
+                        }
+                        
+                        std::fs::rename(br_path, path).unwrap();
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
         for handle in handles {
             handle.join().unwrap();
@@ -118,5 +143,4 @@ fn brotli_all(output_dir: &str) {
 
         println!("Processed {}%", i * 100 / total);
     });
-
 }
