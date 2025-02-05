@@ -89,19 +89,34 @@ fn mkd(raw_image: &str, preload_sectors: &[u32], output_dir: &str) {
 }
 
 fn brotli_all(output_dir: &str) {
-    let files = std::fs::read_dir(output_dir).unwrap();
-    for file in files {
-        let path = file.unwrap().path();
+    let files: Vec<_> = std::fs::read_dir(output_dir).unwrap().flatten().collect();
+    let num_cpus = num_cpus::get();
+    let chunks = files.chunks(files.len().div_ceil(num_cpus));
 
-        let status = Command::new("brotli")
-            .arg("-Z")
-            .arg(&path)
-            .status()
-            .unwrap();
+    let total = chunks.len();
+    println!("Compressing {} files on {} CPUs", files.len(), num_cpus);
+    chunks.enumerate().for_each(|(i, chunk)| {
+        let handles: Vec<_> = chunk.iter().map(|file| {
+            let path = file.path();
+            std::thread::spawn(move || {
+                let status = Command::new("brotli")
+                    .arg("-Zj")
+                    .arg(&path)
+                    .status()
+                    .unwrap();
 
-        if !status.success() {
-            eprintln!("Failed to compress {:?}", path);
-            std::process::exit(1);
+                if !status.success() {
+                    eprintln!("Failed to compress {:?}", path);
+                    std::process::exit(1);
+                }
+            })
+        }).collect();
+
+        for handle in handles {
+            handle.join().unwrap();
         }
-    }
+
+        println!("Processed {}%", i * 100 / total);
+    });
+
 }
