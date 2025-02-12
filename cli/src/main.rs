@@ -1,10 +1,12 @@
-use std::fs::File;
+use std::fs::{copy, create_dir, metadata, read_dir, remove_file, rename, write, File};
 use std::io::{Read, Seek, Write};
 use std::process::Command;
 
 const AHEAD_READ_KB: u32 = 256;
 const SECTOR_SIZE: u32 = 512;
 const AHEAD_READ_SECTORS: u32 = AHEAD_READ_KB * 1024 / SECTOR_SIZE;
+const FAT16_256MB: &str = include_str!("../drives/fat16-256mb.json");
+const FAT32_2GB: &str = include_str!("../drives/fat32-2gb.json");
 
 fn main() {
     println!();
@@ -16,11 +18,14 @@ fn main() {
 sockdrive cli
 
 Usage:
-    sockdrive mkd <raw_image> <preload_sectors> <output_dir>
+    sockdrive mkd <raw_image> <preload_sectors> <output_dir> [-b]
 
     raw_image: path to the raw image file
     preload_sectors: comma separated list of sectors to preload on startup
     output_dir: path to the output directory
+    -b: enable brotli compression (brotli cmd should be in PATH)
+Note:
+    you can use '_' as a preload sector to preload all sectors
 
 Example:
     sockdrive mkd win95v1.raw ./output
@@ -29,35 +34,81 @@ Example:
         std::process::exit(1);
     }
 
-    if !std::path::Path::new(&args[2]).exists() {
-        eprintln!("Error: Input file '{}' does not exist", args[2]);
+    let input_file = &args[2];
+    let preload = &args[3];
+    let output_dir = &args[4];
+
+    if !std::path::Path::new(&input_file).exists() {
+        eprintln!("Error: Input file '{}' does not exist", input_file);
         std::process::exit(1);
     }
 
-    let preload_sectors: Vec<u32> = args[3]
-        .split(',')
-        .filter_map(|s| s.trim().parse().ok())
-        .collect();
+    let input_size = metadata(&input_file).unwrap().len();
+    let fat16_256mb: serde_json::Value = serde_json::from_str(FAT16_256MB).unwrap();
+    let fat32_2gb: serde_json::Value = serde_json::from_str(FAT32_2GB).unwrap();
+    let fat16_256mb_size = fat16_256mb.get("size").unwrap().as_u64().unwrap() * 1024;
+    let fat32_2gb_size = fat32_2gb.get("size").unwrap().as_u64().unwrap() * 1024;
 
-    if std::path::Path::new(&args[4]).exists() {
-        eprintln!("Error: Output directory '{}' exists", args[4]);
+    let mut config = if input_size == fat16_256mb_size {
+        fat16_256mb
+    } else if input_size == fat32_2gb_size {
+        fat32_2gb
+    } else {
+        eprintln!("Error: Input file size ({}) should match to one of templates (FAT16-256MB: {} or FAT32-2GB: {})", 
+            input_size,
+            fat16_256mb_size, fat32_2gb_size);
         std::process::exit(1);
-    }
+    };
 
-    mkd(&args[2], &preload_sectors, &args[4]);
-    brotli_all(&args[4]);
+    if std::path::Path::new(&output_dir).exists() {
+        eprintln!("Error: Output directory '{}' exists", output_dir);
+        std::process::exit(1);
+    };
+
+    create_dir(&output_dir).unwrap();
+
+    if preload == "_" {
+        copy(&input_file, format!("{}/_.raw", output_dir)).unwrap();
+    } else {
+        let mut preload_sectors = preload
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+
+        mkd(&input_file, &mut preload_sectors, &output_dir);
+        config.as_object_mut().unwrap().insert(
+            String::from("preload_sectors"),
+            serde_json::json!(preload_sectors),
+        );
+    };
+
+    write(
+        format!("{}/sockdrive.json", output_dir),
+        serde_json::to_string(&config).unwrap(),
+    )
+    .unwrap();
+
+    if args.contains(&"-b".to_string()) {
+        brotli_all(&output_dir);
+    }
 }
 
-fn mkd(raw_image: &str, preload_sectors: &[u32], output_dir: &str) {
+fn mkd(raw_image: &str, preload_sectors: &mut Vec<u32>, output_dir: &str) {
     let mut raw = File::open(raw_image).unwrap();
     let mut buffer = vec![0u8; SECTOR_SIZE as usize];
-    std::fs::create_dir(output_dir).unwrap();
 
     let sectors = raw.metadata().unwrap().len() as u32 / SECTOR_SIZE;
 
+    let mut preload_sectors = preload_sectors.to_vec();
+    if preload_sectors.is_empty() {
+        for sector in 0..sectors {
+            preload_sectors.push(sector);
+        }
+    }
+
     // making preload file
     let mut preload_file = File::create(format!("{}/_.raw", output_dir)).unwrap();
-    for &sector in preload_sectors {
+    for sector in preload_sectors.to_owned() {
         raw.seek(std::io::SeekFrom::Start(
             (sector as u64) * SECTOR_SIZE as u64,
         ))
@@ -83,13 +134,13 @@ fn mkd(raw_image: &str, preload_sectors: &[u32], output_dir: &str) {
         }
         if size == 0 {
             ahead_file.flush().unwrap();
-            std::fs::remove_file(format!("{}/{}.raw", output_dir, i)).unwrap();
+            remove_file(format!("{}/{}.raw", output_dir, i)).unwrap();
         }
     }
 }
 
 fn brotli_all(output_dir: &str) {
-    let files: Vec<_> = std::fs::read_dir(output_dir).unwrap().flatten().collect();
+    let files: Vec<_> = read_dir(output_dir).unwrap().flatten().collect();
     let num_cpus = num_cpus::get();
     let chunks = files.chunks(files.len().div_ceil(num_cpus));
 
@@ -113,13 +164,13 @@ fn brotli_all(output_dir: &str) {
                     }
 
                     let br_path = path.with_extension("raw.br");
-                    let orig_size = std::fs::metadata(&path).unwrap().len();
-                    let br_size = std::fs::metadata(&br_path).unwrap().len();
+                    let orig_size = metadata(&path).unwrap().len();
+                    let br_size = metadata(&br_path).unwrap().len();
 
                     if br_size < orig_size {
-                        std::fs::rename(br_path, path).unwrap();
+                        rename(br_path, path).unwrap();
                     } else {
-                        std::fs::remove_file(&br_path).unwrap();
+                        remove_file(&br_path).unwrap();
                         let status = Command::new("brotli")
                             .arg("-0")
                             .arg(&path)
@@ -130,8 +181,8 @@ fn brotli_all(output_dir: &str) {
                             eprintln!("Failed to compress {:?}", path);
                             std::process::exit(1);
                         }
-                        
-                        std::fs::rename(br_path, path).unwrap();
+
+                        rename(br_path, path).unwrap();
                     }
                 })
             })

@@ -1,0 +1,8 @@
+{
+    "name": "fat16-256m",
+    "size": 246456,
+    "heads": 16,
+    "cylinders": 489,
+    "sectors": 63,
+    "sector_size": 512
+}

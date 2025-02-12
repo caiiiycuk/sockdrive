@@ -1,0 +1,8 @@
+{
+    "name": "fat32-2gb",
+    "size": 2097152,
+    "heads": 128,
+    "cylinders": 520,
+    "sectors": 63,
+    "sector_size": 512
+}
