@@ -43,7 +43,7 @@ Example:
         std::process::exit(1);
     }
 
-    let input_size = metadata(&input_file).unwrap().len();
+    let input_size = metadata(input_file).unwrap().len();
     let fat16_256mb: serde_json::Value = serde_json::from_str(FAT16_256MB).unwrap();
     let fat32_2gb: serde_json::Value = serde_json::from_str(FAT32_2GB).unwrap();
     let fat16_256mb_size = fat16_256mb.get("size").unwrap().as_u64().unwrap() * 1024;
@@ -65,17 +65,17 @@ Example:
         std::process::exit(1);
     };
 
-    create_dir(&output_dir).unwrap();
+    create_dir(output_dir).unwrap();
 
     if preload == "_" {
-        copy(&input_file, format!("{}/_.raw", output_dir)).unwrap();
+        copy(input_file, format!("{}/_.raw", output_dir)).unwrap();
     } else {
-        let mut preload_sectors = preload
+        let preload_sectors: Vec<u32> = preload
             .split(',')
             .filter_map(|s| s.trim().parse().ok())
             .collect();
 
-        mkd(&input_file, &mut preload_sectors, &output_dir);
+        mkd(input_file, &preload_sectors, output_dir);
         config.as_object_mut().unwrap().insert(
             String::from("preload_sectors"),
             serde_json::json!(preload_sectors),
@@ -89,11 +89,11 @@ Example:
     .unwrap();
 
     if args.contains(&"-b".to_string()) {
-        brotli_all(&output_dir);
+        brotli_all(output_dir);
     }
 }
 
-fn mkd(raw_image: &str, preload_sectors: &mut Vec<u32>, output_dir: &str) {
+fn mkd(raw_image: &str, preload_sectors: &[u32], output_dir: &str) {
     let mut raw = File::open(raw_image).unwrap();
     let mut buffer = vec![0u8; SECTOR_SIZE as usize];
 
@@ -108,9 +108,9 @@ fn mkd(raw_image: &str, preload_sectors: &mut Vec<u32>, output_dir: &str) {
 
     // making preload file
     let mut preload_file = File::create(format!("{}/_.raw", output_dir)).unwrap();
-    for sector in preload_sectors.to_owned() {
+    for sector in preload_sectors.iter() {
         raw.seek(std::io::SeekFrom::Start(
-            (sector as u64) * SECTOR_SIZE as u64,
+            (*sector as u64) * SECTOR_SIZE as u64,
         ))
         .unwrap();
         raw.read_exact(&mut buffer).unwrap();
@@ -119,14 +119,14 @@ fn mkd(raw_image: &str, preload_sectors: &mut Vec<u32>, output_dir: &str) {
 
     // making ahead files
     raw.seek(std::io::SeekFrom::Start(0)).unwrap();
-    for i in 0..sectors / AHEAD_READ_SECTORS as u32 {
+    for i in 0..sectors / AHEAD_READ_SECTORS {
         let mut ahead_file = File::create(format!("{}/{}.raw", output_dir, i)).unwrap();
         let mut size = 0;
-        for sector in 0..AHEAD_READ_SECTORS as u32 {
-            let sector = i * AHEAD_READ_SECTORS + sector as u32;
+        for sector in 0..AHEAD_READ_SECTORS {
+            let sector = i * AHEAD_READ_SECTORS + sector;
             if !preload_sectors.contains(&sector) {
                 raw.read_exact(&mut buffer).unwrap();
-                if buffer.iter().find(|&x| *x != 0).is_some() {
+                if buffer.iter().any(|x| *x != 0) {
                     size += SECTOR_SIZE;
                 }
                 ahead_file.write_all(&buffer).unwrap();
