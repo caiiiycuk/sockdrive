@@ -1,31 +1,31 @@
-use std::fs::{copy, create_dir, metadata, read_dir, remove_file, rename, write, File};
+use std::fs::{create_dir, metadata, read_dir, remove_file, rename, write, File};
 use std::io::{Read, Seek, Write};
 use std::process::Command;
 
-const AHEAD_READ_KB: u32 = 256;
-const SECTOR_SIZE: u32 = 512;
-const AHEAD_READ_SECTORS: u32 = AHEAD_READ_KB * 1024 / SECTOR_SIZE;
+const AHEAD_READ_KB: u64 = 256;
+const AHEAD_READ_SIZE: u64 = AHEAD_READ_KB * 1024;
 const FAT16_256MB: &str = include_str!("../drives/fat16-256mb.json");
 const FAT32_2GB: &str = include_str!("../drives/fat32-2gb.json");
 
 fn main() {
-    println!();
+    task(std::env::args().collect());
+}
 
-    let args: Vec<String> = std::env::args().collect();
+fn task(args: Vec<String>) {
     if args.len() != 5 || args[1] != "mkd" {
         eprintln!(
             "
 sockdrive cli
 
 Usage:
-    sockdrive mkd <raw_image> <preload_sectors> <output_dir> [-b]
+    sockdrive mkd <raw_image> <preload_ranges> <output_dir> [-b]
 
     raw_image: path to the raw image file
-    preload_sectors: comma separated list of sectors to preload on startup
+    preload_ranges: comma separated list of ranges to preload on startup (range is index, range size is AHEAD_READ_KB(256) * 1024)
     output_dir: path to the output directory
     -b: enable brotli compression (brotli cmd should be in PATH)
 Note:
-    you can use '_' as a preload sector to preload all sectors
+    you can use '_' as a preload sector to preload all ranges
 
 Example:
     sockdrive mkd win95v1.raw ./output
@@ -60,6 +60,21 @@ Example:
         std::process::exit(1);
     };
 
+    let mut range_count = input_size / AHEAD_READ_SIZE;
+    if range_count * AHEAD_READ_SIZE < input_size {
+        range_count += 1;
+    }
+
+    config
+        .as_object_mut()
+        .unwrap()
+        .insert(String::from("range_count"), serde_json::json!(range_count));
+
+    config.as_object_mut().unwrap().insert(
+        String::from("ahead_read_kb"),
+        serde_json::json!(AHEAD_READ_KB),
+    );
+
     if std::path::Path::new(&output_dir).exists() {
         eprintln!("Error: Output directory '{}' exists", output_dir);
         std::process::exit(1);
@@ -67,20 +82,47 @@ Example:
 
     create_dir(output_dir).unwrap();
 
-    if preload == "_" {
-        copy(input_file, format!("{}/_.raw", output_dir)).unwrap();
+    let dropped = mkahead(input_file, range_count as u32, output_dir);
+    config
+        .as_object_mut()
+        .unwrap()
+        .insert(String::from("dropped_ranges"), serde_json::json!(dropped));
+
+    let preload_ranges: Vec<u32> = if preload == "_" {
+        (0..range_count as u32).collect()
     } else {
-        let preload_sectors: Vec<u32> = preload
+        preload
             .split(',')
             .filter_map(|s| s.trim().parse().ok())
-            .collect();
-
-        mkd(input_file, &preload_sectors, output_dir);
-        config.as_object_mut().unwrap().insert(
-            String::from("preload_sectors"),
-            serde_json::json!(preload_sectors),
-        );
+            .collect()
     };
+
+    for range in preload_ranges.iter() {
+        assert!(
+            *range < range_count as u32,
+            "range {} is greater then range count {}",
+            range,
+            range_count
+        );
+    }
+
+    let preload_ranges: Vec<u32> = preload_ranges.iter().filter(|range| !dropped.contains(range))
+        .copied().collect();
+
+    mkpreload(&preload_ranges, output_dir);
+
+    
+    if preload == "_" {
+        config.as_object_mut().unwrap().insert(
+            String::from("preload_ranges"),
+            serde_json::json!("_"),
+        );
+    } else {
+        config.as_object_mut().unwrap().insert(
+            String::from("preload_ranges"),
+            serde_json::json!(preload_ranges),
+        );
+    }
 
     write(
         format!("{}/sockdrive.json", output_dir),
@@ -93,49 +135,42 @@ Example:
     }
 }
 
-fn mkd(raw_image: &str, preload_sectors: &[u32], output_dir: &str) {
+fn mkahead(raw_image: &str, range_count: u32, output_dir: &str) -> Vec<u32> {
     let mut raw = File::open(raw_image).unwrap();
-    let mut buffer = vec![0u8; SECTOR_SIZE as usize];
+    let mut buffer = vec![0u8; AHEAD_READ_SIZE as usize];
+    let mut dropped = Vec::new();
+    let raw_size = raw.metadata().unwrap().len() as usize;
 
-    let sectors = raw.metadata().unwrap().len() as u32 / SECTOR_SIZE;
-
-    let mut preload_sectors = preload_sectors.to_vec();
-    if preload_sectors.is_empty() {
-        for sector in 0..sectors {
-            preload_sectors.push(sector);
-        }
-    }
-
-    // making preload file
-    let mut preload_file = File::create(format!("{}/_.raw", output_dir)).unwrap();
-    for sector in preload_sectors.iter() {
-        raw.seek(std::io::SeekFrom::Start(
-            (*sector as u64) * SECTOR_SIZE as u64,
-        ))
-        .unwrap();
-        raw.read_exact(&mut buffer).unwrap();
-        preload_file.write_all(&buffer).unwrap();
-    }
-
-    // making ahead files
     raw.seek(std::io::SeekFrom::Start(0)).unwrap();
-    for i in 0..sectors / AHEAD_READ_SECTORS {
-        let mut ahead_file = File::create(format!("{}/{}.raw", output_dir, i)).unwrap();
-        let mut size = 0;
-        for sector in 0..AHEAD_READ_SECTORS {
-            let sector = i * AHEAD_READ_SECTORS + sector;
-            if !preload_sectors.contains(&sector) {
-                raw.read_exact(&mut buffer).unwrap();
-                if buffer.iter().any(|x| *x != 0) {
-                    size += SECTOR_SIZE;
-                }
-                ahead_file.write_all(&buffer).unwrap();
-            }
+    for i in 0..range_count {
+        if ((i + 1) as u64 * AHEAD_READ_SIZE) as usize > raw_size {
+            buffer.fill(0);
+            raw.read_exact(&mut buffer[..raw_size - i as usize * AHEAD_READ_SIZE as usize]).unwrap();
+        } else {
+            raw.read_exact(&mut buffer).unwrap();
         }
-        if size == 0 {
-            ahead_file.flush().unwrap();
-            remove_file(format!("{}/{}.raw", output_dir, i)).unwrap();
+
+        if buffer.iter().any(|x| *x != 0) {
+            let mut ahead_file = File::create(format!("{}/{}.raw", output_dir, i)).unwrap();
+            ahead_file.write_all(&buffer).unwrap();
+        } else {
+            dropped.push(i);
         }
+    }
+
+    dropped
+}
+
+fn mkpreload(preload_ranges: &[u32], output_dir: &str) {
+    let mut preload_file = File::create(format!("{}/_.raw", output_dir)).unwrap();
+    let mut buffer = vec![0u8; AHEAD_READ_SIZE as usize];
+    for range in preload_ranges.iter() {
+        let name = format!("{}/{}.raw", output_dir, range);
+        let mut range_file = File::open(&name).unwrap();
+        range_file.read_exact(&mut buffer).unwrap();
+        preload_file.write_all(&buffer).unwrap();
+        drop(range_file);
+        remove_file(&name).unwrap();
     }
 }
 
@@ -194,4 +229,89 @@ fn brotli_all(output_dir: &str) {
 
         println!("Processed {}%", i * 100 / total);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::remove_dir_all;
+    use std::path::Path;
+
+    #[test]
+    fn test_fat16_256mb_exists() {
+        let path = Path::new("../test-assets/fat16-256mb.raw");
+        assert!(path.exists(), "fat16-256mb.raw file should exist, please run `./test-assets/generate.sh` from root to generate it");
+    }
+
+    #[test]
+    fn test_fat32_2gb_exists() {
+        let path = Path::new("../test-assets/fat32-2gb.raw");
+        assert!(path.exists(), "fat32-2gb.raw file should exist, please run `./test-assets/generate.sh` from root to generate it");
+    }
+
+    #[test]
+    fn test_mkd_fat16_256mb() {
+        test_mkd(
+            "../test-assets/fat16-256mb.raw",
+            &[0, 1, 2],
+            "../test-assets/fat16-256mb",
+        );
+    }
+
+    #[test]
+    fn test_mkd_fat32_2gb() {
+        test_mkd(
+            "../test-assets/fat32-2gb.raw",
+            &[0, 1, 2],
+            "../test-assets/fat32-2gb",
+        );
+    }
+
+    fn test_mkd(input_file: &str, preload_ranges: &[u32], output_dir: &str) {
+        if Path::new(output_dir).exists() {
+            remove_dir_all(output_dir).unwrap();
+        }
+
+        let args = vec![
+            "sockdrive".to_string(),
+            "mkd".to_string(),
+            input_file.to_string(),
+            preload_ranges
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            output_dir.to_string(),
+        ];
+
+        task(args);
+
+        let raw_path = Path::new(output_dir).join("_.raw");
+        assert!(raw_path.exists(), "_.raw file should exist");
+
+        let raw_path = Path::new(output_dir).join("1.raw");
+        assert!(!raw_path.exists(), "1.raw file should not exist");
+
+        let config_path = Path::new(output_dir).join("sockdrive.json");
+        assert!(config_path.exists(), "sockdrive.json should exist");
+
+        let config_str = std::fs::read_to_string(config_path).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+
+        let preload_ranges = config
+            .get("preload_ranges")
+            .expect("sockdrive.json should have preload_ranges field")
+            .as_array()
+            .expect("preload_ranges should be an array");
+
+        assert_eq!(
+            preload_ranges
+                .iter()
+                .map(|v| v.as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            preload_ranges.to_vec(),
+            "preload_ranges should be {:?}",
+            preload_ranges
+        );
+    }
 }

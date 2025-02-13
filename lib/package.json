@@ -1,9 +1,9 @@
 {
-  "name": "rollup-starter-lib",
+  "name": "sockdrive",
   "version": "1.0.0",
-  "main": "dist/how-long-till-lunch.cjs.js",
-  "module": "dist/how-long-till-lunch.esm.js",
-  "browser": "dist/how-long-till-lunch.umd.js",
+  "main": "dist/sockdrive.cjs.js",
+  "module": "dist/sockdrive.esm.js",
+  "browser": "dist/sockdrive.umd.js",
   "dependencies": {
     "ms": "^2.0.0"
   },
