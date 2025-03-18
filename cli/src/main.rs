@@ -2,8 +2,7 @@ use std::fs::{create_dir, metadata, read_dir, remove_file, rename, write, File};
 use std::io::{Read, Seek, Write};
 use std::process::Command;
 
-const AHEAD_READ_KB: u64 = 256;
-const AHEAD_READ_SIZE: u64 = AHEAD_READ_KB * 1024;
+const AHEAD_READ_SIZE: u64 = 256 * 1024;
 const FAT16_256MB: &str = include_str!("../drives/fat16-256mb.json");
 const FAT32_2GB: &str = include_str!("../drives/fat32-2gb.json");
 
@@ -12,7 +11,7 @@ fn main() {
 }
 
 fn task(args: Vec<String>) {
-    if args.len() != 5 || args[1] != "mkd" {
+    if args.len() < 5 || args[1] != "mkd" {
         eprintln!(
             "
 sockdrive cli
@@ -21,14 +20,14 @@ Usage:
     sockdrive mkd <raw_image> <preload_ranges> <output_dir> [-b]
 
     raw_image: path to the raw image file
-    preload_ranges: comma separated list of ranges to preload on startup (range is index, range size is AHEAD_READ_KB(256) * 1024)
+    preload_ranges: comma separated list of ranges to preload on startup (range is index, range size is AHEAD_READ_SIZE(256 * 1024))
     output_dir: path to the output directory
     -b: enable brotli compression (brotli cmd should be in PATH)
 Note:
     you can use '_' as a preload sector to preload all ranges
 
 Example:
-    sockdrive mkd win95v1.raw ./output
+    sockdrive mkd win95v1.raw ./output [-b]
         "
         );
         std::process::exit(1);
@@ -71,8 +70,8 @@ Example:
         .insert(String::from("range_count"), serde_json::json!(range_count));
 
     config.as_object_mut().unwrap().insert(
-        String::from("ahead_read_kb"),
-        serde_json::json!(AHEAD_READ_KB),
+        String::from("ahead_read"),
+        serde_json::json!(AHEAD_READ_SIZE),
     );
 
     if std::path::Path::new(&output_dir).exists() {
@@ -106,18 +105,18 @@ Example:
         );
     }
 
-    let preload_ranges: Vec<u32> = preload_ranges.iter().filter(|range| !dropped.contains(range))
-        .copied().collect();
-
-    mkpreload(&preload_ranges, output_dir);
-
-    
     if preload == "_" {
-        config.as_object_mut().unwrap().insert(
-            String::from("preload_ranges"),
-            serde_json::json!("_"),
-        );
+        config
+            .as_object_mut()
+            .unwrap()
+            .insert(String::from("preload_ranges"), serde_json::json!("_"));
     } else {
+        let preload_ranges: Vec<u32> = preload_ranges
+            .iter()
+            .filter(|range| !dropped.contains(range))
+            .copied()
+            .collect();
+
         config.as_object_mut().unwrap().insert(
             String::from("preload_ranges"),
             serde_json::json!(preload_ranges),
@@ -125,7 +124,7 @@ Example:
     }
 
     write(
-        format!("{}/sockdrive.json", output_dir),
+        format!("{}/sockdrive.metaj", output_dir),
         serde_json::to_string(&config).unwrap(),
     )
     .unwrap();
@@ -145,7 +144,8 @@ fn mkahead(raw_image: &str, range_count: u32, output_dir: &str) -> Vec<u32> {
     for i in 0..range_count {
         if ((i + 1) as u64 * AHEAD_READ_SIZE) as usize > raw_size {
             buffer.fill(0);
-            raw.read_exact(&mut buffer[..raw_size - i as usize * AHEAD_READ_SIZE as usize]).unwrap();
+            raw.read_exact(&mut buffer[..raw_size - i as usize * AHEAD_READ_SIZE as usize])
+                .unwrap();
         } else {
             raw.read_exact(&mut buffer).unwrap();
         }
@@ -159,19 +159,6 @@ fn mkahead(raw_image: &str, range_count: u32, output_dir: &str) -> Vec<u32> {
     }
 
     dropped
-}
-
-fn mkpreload(preload_ranges: &[u32], output_dir: &str) {
-    let mut preload_file = File::create(format!("{}/_.raw", output_dir)).unwrap();
-    let mut buffer = vec![0u8; AHEAD_READ_SIZE as usize];
-    for range in preload_ranges.iter() {
-        let name = format!("{}/{}.raw", output_dir, range);
-        let mut range_file = File::open(&name).unwrap();
-        range_file.read_exact(&mut buffer).unwrap();
-        preload_file.write_all(&buffer).unwrap();
-        drop(range_file);
-        remove_file(&name).unwrap();
-    }
 }
 
 fn brotli_all(output_dir: &str) {
@@ -188,7 +175,7 @@ fn brotli_all(output_dir: &str) {
                 let path = file.path();
                 std::thread::spawn(move || {
                     let status = Command::new("brotli")
-                        .arg("-Z")
+                        .arg("-Zk")
                         .arg(&path)
                         .status()
                         .unwrap();
@@ -198,16 +185,23 @@ fn brotli_all(output_dir: &str) {
                         std::process::exit(1);
                     }
 
-                    let br_path = path.with_extension("raw.br");
+                    let br_path = format!("{}.br", &path.display());
                     let orig_size = metadata(&path).unwrap().len();
-                    let br_size = metadata(&br_path).unwrap().len();
+                    let br_size = match metadata(&br_path) {
+                        Ok(meta) => meta.len(),
+                        Err(_) => { 
+                            println!("Failed to get metadata for {:?}", br_path);
+                            std::process::exit(1);
+                        },
+                    };
 
                     if br_size < orig_size {
+                        remove_file(&path).unwrap();
                         rename(br_path, path).unwrap();
                     } else {
                         remove_file(&br_path).unwrap();
                         let status = Command::new("brotli")
-                            .arg("-0")
+                            .arg("-0k")
                             .arg(&path)
                             .status()
                             .unwrap();
@@ -217,6 +211,7 @@ fn brotli_all(output_dir: &str) {
                             std::process::exit(1);
                         }
 
+                        remove_file(&path).unwrap();
                         rename(br_path, path).unwrap();
                     }
                 })
@@ -286,21 +281,18 @@ mod tests {
 
         task(args);
 
-        let raw_path = Path::new(output_dir).join("_.raw");
-        assert!(raw_path.exists(), "_.raw file should exist");
-
         let raw_path = Path::new(output_dir).join("1.raw");
         assert!(!raw_path.exists(), "1.raw file should not exist");
 
-        let config_path = Path::new(output_dir).join("sockdrive.json");
-        assert!(config_path.exists(), "sockdrive.json should exist");
+        let config_path = Path::new(output_dir).join("sockdrive.metaj");
+        assert!(config_path.exists(), "sockdrive.metaj should exist");
 
         let config_str = std::fs::read_to_string(config_path).unwrap();
         let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
 
         let preload_ranges = config
             .get("preload_ranges")
-            .expect("sockdrive.json should have preload_ranges field")
+            .expect("sockdrive.metaj should have preload_ranges field")
             .as_array()
             .expect("preload_ranges should be an array");
 

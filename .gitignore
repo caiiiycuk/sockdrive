@@ -4,3 +4,5 @@ cli/target/
 test-assets/fat16-256mb*
 test-assets/fat32-2gb*
 lib/dist/
+lib/node_modules
+sync.sh

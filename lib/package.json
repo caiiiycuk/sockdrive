@@ -4,18 +4,16 @@
   "main": "dist/sockdrive.cjs.js",
   "module": "dist/sockdrive.esm.js",
   "browser": "dist/sockdrive.umd.js",
-  "dependencies": {
-    "ms": "^2.0.0"
-  },
   "devDependencies": {
-    "@types/ms": "^0.7.30",
-    "rollup": "^1.0.0",
-    "rollup-plugin-commonjs": "^9.2.0",
-    "rollup-plugin-node-resolve": "^4.0.0",
-    "rollup-plugin-typescript": "^1.0.0",
-    "ts-node": "^7.0.1",
-    "tslib": "^1.9.3",
-    "typescript": "^3.2.2"
+    "@types/ms": "^2.1.0",
+    "@typescript-eslint/eslint-plugin": "^8.24.0",
+    "@typescript-eslint/parser": "^8.24.0",
+    "eslint": "^8.56.0",
+    "eslint-config-google": "^0.14.0",
+    "rollup": "^4.34.7",
+    "ts-node": "^10.9.2",
+    "tslib": "^2.8.1",
+    "typescript": "^5.7.3"
   },
   "scripts": {
     "build": "rollup -c",
