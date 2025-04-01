@@ -97,12 +97,13 @@ Example:
     };
 
     for range in preload_ranges.iter() {
-        assert!(
-            *range < range_count as u32,
-            "range {} is greater then range count {}",
-            range,
-            range_count
-        );
+        if *range >= range_count as u32 {
+            eprintln!(
+                "range {} is greater then range count {}",
+                range,
+                range_count
+            );
+        }
     }
 
     if preload == "_" {
