@@ -5,6 +5,7 @@ use std::process::Command;
 const AHEAD_READ_SIZE: u64 = 256 * 1024;
 const FAT16_256MB: &str = include_str!("../drives/fat16-256mb.json");
 const FAT32_2GB: &str = include_str!("../drives/fat32-2gb.json");
+const SMALL_FILES_THRESHOLD: u64 = 2 * 1024;
 
 fn main() {
     task(std::env::args().collect());
@@ -130,6 +131,8 @@ Example:
     )
     .unwrap();
 
+    println!("Done, created {} files in {}", range_count - dropped.len() as u64, output_dir);
+
     if args.contains(&"-b".to_string()) {
         brotli_all(output_dir);
     }
@@ -168,6 +171,7 @@ fn brotli_all(output_dir: &str) {
     let chunks = files.chunks(files.len().div_ceil(num_cpus));
 
     let total = chunks.len();
+    // let small_files = Vec::new();
     println!("Compressing {} files on {} CPUs", files.len(), num_cpus);
     chunks.enumerate().for_each(|(i, chunk)| {
         let handles: Vec<_> = chunk
@@ -235,31 +239,31 @@ mod tests {
 
     #[test]
     fn test_fat16_256mb_exists() {
-        let path = Path::new("../test-assets/fat16-256mb.raw");
+        let path = Path::new("test-assets/fat16-256mb.raw");
         assert!(path.exists(), "fat16-256mb.raw file should exist, please run `./test-assets/generate.sh` from root to generate it");
     }
 
     #[test]
     fn test_fat32_2gb_exists() {
-        let path = Path::new("../test-assets/fat32-2gb.raw");
+        let path = Path::new("test-assets/fat32-2gb.raw");
         assert!(path.exists(), "fat32-2gb.raw file should exist, please run `./test-assets/generate.sh` from root to generate it");
     }
 
     #[test]
     fn test_mkd_fat16_256mb() {
         test_mkd(
-            "../test-assets/fat16-256mb.raw",
+            "test-assets/fat16-256mb.raw",
             &[0, 1, 2],
-            "../test-assets/fat16-256mb",
+            "test-assets/fat16-256mb",
         );
     }
 
     #[test]
     fn test_mkd_fat32_2gb() {
         test_mkd(
-            "../test-assets/fat32-2gb.raw",
+            "test-assets/fat32-2gb.raw",
             &[0, 1, 2],
-            "../test-assets/fat32-2gb",
+            "test-assets/fat32-2gb",
         );
     }
 
