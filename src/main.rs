@@ -8,7 +8,8 @@ const FAT32_2GB: &str = include_str!("../drives/fat32-2gb.json");
 const SMALL_FILES_THRESHOLD: u64 = 25 * 1024;
 
 fn main() {
-    task(std::env::args().collect());
+    // task(std::env::args().collect());
+    reduce_small_files("/tmp/dos.zone-PerformanceTest", &mut serde_json::Value::Object(serde_json::Map::new()));
 }
 
 fn task(args: Vec<String>) {
@@ -138,7 +139,7 @@ Example:
 
     if args.contains(&"-b".to_string()) {
         brotli_all(output_dir);
-        reduce_small_files(output_dir, &mut config);
+        // reduce_small_files(output_dir, &mut config);
     }
 }
 
@@ -271,7 +272,7 @@ fn reduce_small_files(output_dir: &str, metaj: &mut serde_json::Value) {
             file_locations.push((filename, start_offset, end_offset));
             current_offset = end_offset;
 
-            remove_file(path).unwrap();
+            // remove_file(path).unwrap();
         }
 
         let status = Command::new("brotli")
@@ -307,7 +308,7 @@ fn reduce_small_files(output_dir: &str, metaj: &mut serde_json::Value) {
         let metaj_file = format!("{}/sockdrive.metaj", output_dir);
         write(
             &metaj_file,
-            serde_json::to_string_pretty(&metaj).unwrap(),
+            serde_json::to_string(&metaj).unwrap(),
         )
         .unwrap();
 
