@@ -240,20 +240,25 @@ fn reduce_small_files(output_dir: &str, metaj: &mut serde_json::Value) {
     let mut all_files = Vec::new();
 
     for file in files {
-        if file.path().to_string_lossy().ends_with("metaj") || file.path().ends_with("preload.raw") {
+        if file.path().to_string_lossy().ends_with("metaj") || file.path().ends_with("preload.raw")
+        {
             continue;
         }
 
         let path = file.path();
         let size = metadata(&path).unwrap().len();
-        assert!(size <= AHEAD_READ_SIZE + 100, 
-            "{}, range size should be less than AHEAD_READ_SIZE: {} > {}", 
-            &path.display(), size, AHEAD_READ_SIZE);
+        assert!(
+            size <= AHEAD_READ_SIZE + 100,
+            "{}, range size should be less than AHEAD_READ_SIZE: {} > {}",
+            &path.display(),
+            size,
+            AHEAD_READ_SIZE
+        );
         all_files.push((path, size));
     }
 
     all_files.sort_by_key(|(_, size)| *size);
-    
+
     let mut small_files = Vec::new();
     let mut total_size = 0;
 
@@ -289,12 +294,21 @@ fn reduce_small_files(output_dir: &str, metaj: &mut serde_json::Value) {
             let offset = file_contents.len() as u64;
             file.read_to_end(&mut file_contents).unwrap();
             let size = file_contents.len() - offset as usize;
-            assert!(size == AHEAD_READ_SIZE as usize, 
-                "file size should be AHEAD_READ_SIZE: {} != {}", 
-                size, AHEAD_READ_SIZE);
+            assert!(
+                size == AHEAD_READ_SIZE as usize,
+                "file size should be AHEAD_READ_SIZE: {} != {}",
+                size,
+                AHEAD_READ_SIZE
+            );
 
-
-            file_locations.push(path.file_stem().unwrap().to_string_lossy().to_string().parse::<i32>().unwrap());
+            file_locations.push(
+                path.file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+                    .parse::<i32>()
+                    .unwrap(),
+            );
             remove_file(&decoded_path).unwrap();
             remove_file(path).unwrap();
         }
@@ -304,8 +318,8 @@ fn reduce_small_files(output_dir: &str, metaj: &mut serde_json::Value) {
         preload_file.write_all(&file_contents).unwrap();
 
         println!("Found {} small files, compressed size: {} kb, computed size: {} kb, preload file size: {} kb", 
-            small_files.len(), 
-            total_size / 1024, 
+            small_files.len(),
+            total_size / 1024,
             small_files.len() * AHEAD_READ_SIZE as usize / 1024,
             file_contents.len() / 1024);
 
@@ -322,7 +336,10 @@ fn reduce_small_files(output_dir: &str, metaj: &mut serde_json::Value) {
 
         remove_file(&preload_file_str).unwrap();
         rename(format!("{}/preload.raw.br", output_dir), &preload_file_str).unwrap();
-        println!("Preload file size: {} kb", metadata(&preload_file_str).unwrap().len() / 1024);
+        println!(
+            "Preload file size: {} kb",
+            metadata(&preload_file_str).unwrap().len() / 1024
+        );
 
         metaj.as_object_mut().unwrap().insert(
             String::from("small_ranges"),
@@ -330,11 +347,7 @@ fn reduce_small_files(output_dir: &str, metaj: &mut serde_json::Value) {
         );
 
         let metaj_file = format!("{}/sockdrive.metaj", output_dir);
-        write(
-            &metaj_file,
-            serde_json::to_string(&metaj).unwrap(),
-        )
-        .unwrap();
+        write(&metaj_file, serde_json::to_string(&metaj).unwrap()).unwrap();
 
         let status = Command::new("brotli")
             .arg("-Zk")
