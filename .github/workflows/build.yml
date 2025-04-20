@@ -1,4 +1,4 @@
-name: linux
+name: build
 
 on:
   push:
@@ -14,6 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - name: Prepare
+      run: ./test-assets/generate.sh
     - name: Build
       run: cargo build --verbose
     - name: Run tests
