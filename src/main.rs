@@ -19,14 +19,22 @@ fn task(args: Vec<String>) {
 sockdrive cli
 
 Usage:
-    sockdrive mkd <raw_image> <preload_ranges> <output_dir> [-b]
+    sockdrive mkd <raw_image|qcow2_image> <preload_ranges> <output_dir> [-b]
 
-    raw_image: path to the raw image file
+    raw_image|qcow2_image: path to the raw image file or qcow2 image file
     preload_ranges: comma separated list of ranges to preload on startup (range is index, range size is AHEAD_READ_SIZE(256 * 1024))
     output_dir: path to the output directory
     -b: enable brotli compression (brotli cmd should be in PATH)
-Note:
+
+Note 1:
     you can use '_' as a preload sector to preload all ranges
+
+Note 2:
+    if you use qcow2 image then you must change permissions of /boot/vmlinuz-*
+    sudo chmod +r /boot/vmlinuz-*
+    
+    more:
+    https://askubuntu.com/questions/1046828/how-to-run-libguestfs-tools-tools-such-as-virt-make-fs-without-sudo
 
 Example:
     sockdrive mkd win95v1.raw ./output [-b]
@@ -44,7 +52,19 @@ Example:
         std::process::exit(1);
     }
 
-    let input_size = metadata(input_file).unwrap().len();
+    let input_file = if input_file.ends_with(".qcow2") || input_file.ends_with(".qcow") {
+        println!("Converting qcow2 image to raw image");
+        let raw = format!("{}.raw", input_file);
+        Command::new("virt-sparsify")
+            .args(["--convert", "raw", input_file, &raw])
+            .status()
+            .expect("Failed to convert qcow2 to raw");
+        raw
+    } else {
+        input_file.to_owned()
+    };
+
+    let input_size = metadata(&input_file).unwrap().len();
     let fat16_256mb: serde_json::Value = serde_json::from_str(FAT16_256MB).unwrap();
     let fat32_2gb: serde_json::Value = serde_json::from_str(FAT32_2GB).unwrap();
     let fat16_256mb_size = fat16_256mb.get("size").unwrap().as_u64().unwrap() * 1024;
@@ -83,7 +103,7 @@ Example:
 
     create_dir(output_dir).unwrap();
 
-    let dropped = mkahead(input_file, range_count as u32, output_dir);
+    let dropped = mkahead(&input_file, range_count as u32, output_dir);
     config
         .as_object_mut()
         .unwrap()
@@ -95,17 +115,9 @@ Example:
         preload
             .split(',')
             .filter_map(|s| s.trim().parse().ok())
+            .filter(|range| *range < range_count as u32)
             .collect()
     };
-
-    for range in preload_ranges.iter() {
-        if *range >= range_count as u32 {
-            eprintln!(
-                "range {} is greater then range count {}",
-                range, range_count
-            );
-        }
-    }
 
     if preload == "_" {
         config
@@ -140,6 +152,10 @@ Example:
     if args.contains(&"-b".to_string()) {
         brotli_all(output_dir);
         reduce_small_files(output_dir, &mut config);
+    }
+
+    if args[2] != input_file {
+        remove_file(&input_file).unwrap();
     }
 }
 
