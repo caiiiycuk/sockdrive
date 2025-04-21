@@ -1,5 +1,5 @@
 use std::cmp::min;
-use std::fs::{create_dir, metadata, read_dir, remove_file, rename, write, File};
+use std::fs::{create_dir, create_dir_all, metadata, read_dir, remove_file, rename, write, File};
 use std::io::{Read, Seek, Write};
 use std::process::Command;
 
@@ -10,14 +10,174 @@ const SMALL_FILES_THRESHOLD: u64 = 1024 * 1024;
 const DEFAULT_PRELOAD: &str = "0,16,1,52,50,68,51,145,280,152,291,227,234,226,207,279,7195,257,233,179,231,390,177,346,66,71,96,197,297,70,90,113,146,87,89,98,2,93,199,236,54,198,129,228,296,299,311,180,20,100,208,218,219,232,276,300,24,114,143,195,229,239,253,241,277,289,49,155,240,21,23,99,116,151,217,97,202,429,32,157,262,327,200,201,25,156,237,278,329,82,141,142,154,158,178,338,339,84,78,65,148,160,271,282,117,119,144,275,83,85,92,3,159,242,274,105,118,543,64,187,261,269,86,225,545,22,38,57,188,287,330,176,359,544,56,281,295,245,79,30,407,165,194,235,285,465,101,238,411,58,138,193,293,394,133,134,168,412,6,55,62,163,333,343,112,172,428,430,17,18,19,67,184,332,171,104,7,36,284,334,386,395,139,167,357,431,37,76,140,460,244,258,331,532,290,12,13,14,69,153,272,328,396,461,675,175,663,664,149,405,531,15,123,63,464,53,31,221,252,294,340,344,35,60,72,288,246,459,462,463,4,513,546,677,9,75,94,164,216,251,363,220,658,701,397,59,196,230,354,364,667,323,533,729";
 
 fn main() {
-    task(std::env::args().collect());
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 || (args[1] != "mkd" && args[1] != "sockify") {
+        eprintln!(
+            "
+sockdrive cl
+
+Use one of the following commands:
+    sockdrive mkd   - make sockdrive from raw / qcow2 image
+    sockdrive sockify - transform jsdos bundle with qcow2 images to use sockdrive
+            "
+        );
+    } else if args[1] == "mkd" {
+        mkd(args);
+    } else if args[1] == "sockify" {
+        sockify(args);
+    }
 }
 
-fn task(args: Vec<String>) {
+fn sockify(args: Vec<String>) {
+    if args.len() < 6 || args[1] != "sockify" {
+        eprintln!(
+            "
+sockdrive cli: sockify
+
+Usage:
+    sockdrive sockify <jsdos_bundle> <output_dir> <url> <sockified_bundle>
+
+    jsdos_bundle: path to the jsdos bundle file
+    output_dir: path to the output directory (where sockdrive files will be placed)
+    url: url to the sockdrive server (where you need to put sockdrive files)
+    sockified_bundle: path to the resulting jsdos bundle file
+    -b: enable brotli compression (brotli cmd should be in PATH)
+
+Example:
+    sockdrive sockify jsdos.zip ./sockdrive https://my.site jsdos-sockified.zip [-b]
+
+Note:
+    in our example you need to publish context of ./s3 folder to your web-server,
+    they should be available at https://my.site/sockdrive
+        "
+        );
+
+        std::process::exit(1);
+    }
+
+    let jsdos_bundle = &args[2];
+    let output_dir = &args[3];
+    let url = &args[4];
+    let sockified_bundle = &args[5];
+    let temp_dir = format!("{}/sockdrive-temp", output_dir);
+
+    let url = if url.ends_with("/") {
+        url[..url.len() - 1].to_string()
+    } else {
+        url.to_string()
+    };
+
+    let output_dir = if output_dir.starts_with("./") {
+        output_dir[2..].to_string()
+    } else {
+        output_dir.to_string()
+    };
+
+    if std::path::Path::new(&temp_dir).exists() {
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    if std::path::Path::new(&sockified_bundle).exists() {
+        eprintln!("Error: sockified_bundle '{}' exists", sockified_bundle);
+        std::process::exit(1);
+    }
+
+    create_dir_all(&temp_dir).unwrap();
+    let cleanup = || {
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    };
+
+    Command::new("7z")
+        .args(["x", jsdos_bundle, &format!("-o{}", temp_dir)])
+        .status()
+        .unwrap();
+
+    let dosbox_conf = format!("{}/.jsdos/dosbox.conf", temp_dir);
+    if !std::path::Path::new(&dosbox_conf).exists() {
+        eprintln!("Error: dosbox.conf '{}' does not exist", dosbox_conf);
+        cleanup();
+        std::process::exit(1);
+    }
+
+    let dosbox_conf_content = std::fs::read_to_string(&dosbox_conf).unwrap();
+    let mut dosbox_conf_content: Vec<String> =
+        dosbox_conf_content.lines().map(|s| s.to_string()).collect();
+    let imgmount_lines: Vec<(usize, String)> = dosbox_conf_content
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.trim().starts_with("imgmount") && line.contains(".qcow2"))
+        .map(|(i, line)| (i, line.clone()))
+        .collect();
+
+    if imgmount_lines.len() == 0 {
+        eprintln!("Error: qcow2 mounts not found in dosbox.conf");
+        cleanup();
+        std::process::exit(1);
+    }
+
+    for (i, line) in imgmount_lines {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            eprintln!("Error: imgmount line '{}' is invalid", line);
+            cleanup();
+            std::process::exit(1);
+        }
+
+        let drive = parts[1];
+        let path = parts[2];
+        let indrive = format!("{}/{}", temp_dir, path);
+        let outdrive = format!("{}/{}", output_dir, &path[..path.len() - ".qcow2".len()]);
+
+        if std::path::Path::new(&outdrive).exists() {
+            eprintln!("Error: drive '{}' already exists", outdrive);
+            cleanup();
+            std::process::exit(1);
+        }
+
+        if args.contains(&"-b".to_string()) {
+            mkd(vec![
+                "_".to_string(),
+                "mkd".to_string(),
+                indrive.clone(),
+                "_".to_string(),
+                outdrive.clone(),
+                "-b".to_string(),
+            ]);
+        } else {
+            mkd(vec![
+                "_".to_string(),
+                "mkd".to_string(),
+                indrive.clone(),
+                "_".to_string(),
+                outdrive.clone(),
+            ]);
+        }
+
+        dosbox_conf_content[i] = format!("imgmount {} sockdrive {}/{}", drive, url, outdrive);
+        std::fs::remove_file(&indrive).unwrap();
+    }
+
+    std::fs::write(&dosbox_conf, dosbox_conf_content.join("\n")).unwrap();
+
+    Command::new("7z")
+        .args([
+            "a",
+            "-tzip",
+            "-mx0",
+            sockified_bundle,
+            &format!("{}/.", temp_dir),
+        ])
+        .status()
+        .unwrap();
+
+    cleanup();
+}
+
+fn mkd(args: Vec<String>) {
     if args.len() < 5 || args[1] != "mkd" {
         eprintln!(
             "
-sockdrive cli
+sockdrive cli: makedrive
 
 Usage:
     sockdrive mkd <raw_image|qcow2_image> <preload_ranges> <output_dir> [-b]
@@ -110,13 +270,16 @@ Example:
         .unwrap()
         .insert(String::from("dropped_ranges"), serde_json::json!(dropped));
 
-    let preload_ranges: Vec<u32> = 
-        if preload == "_" { DEFAULT_PRELOAD } else { preload }
-            .split(',')
-            .filter_map(|s| s.trim().parse().ok())
-            .filter(|range| *range < range_count as u32)
-            .filter(|range| !dropped.contains(range))
-            .collect();
+    let preload_ranges: Vec<u32> = if preload == "_" {
+        DEFAULT_PRELOAD
+    } else {
+        preload
+    }
+    .split(',')
+    .filter_map(|s| s.trim().parse().ok())
+    .filter(|range| *range < range_count as u32)
+    .filter(|range| !dropped.contains(range))
+    .collect();
 
     config.as_object_mut().unwrap().insert(
         String::from("preload_ranges"),
@@ -420,7 +583,7 @@ mod tests {
             output_dir.to_string(),
         ];
 
-        task(args);
+        mkd(args);
 
         let raw_path = Path::new(output_dir).join("1.raw");
         assert!(!raw_path.exists(), "1.raw file should not exist");
