@@ -169,10 +169,7 @@ Note:
             ]);
         }
 
-        dosbox_conf_content[i] = format!(
-            "imgmount {} sockdrive {}/{}{}",
-            drive, url, drive_prefix, outname
-        );
+        dosbox_conf_content[i] = format!("imgmount {} sockdrive {}/{}", drive, url, outname);
         std::fs::remove_file(&indrive).unwrap();
     }
 
