@@ -134,12 +134,12 @@ Note:
         let drive = parts[1];
         let path = parts[2];
         let indrive = format!("{}/{}", temp_dir, path);
-        let outdrive = format!(
-            "{}/{}{}",
-            output_dir,
-            drive_prefix,
-            &path[..path.len() - ".qcow2".len()]
-        );
+        let outname = std::path::Path::new(path)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let outdrive = format!("{}/{}{}", output_dir, drive_prefix, outname);
 
         if std::path::Path::new(&outdrive).exists() {
             eprintln!("Error: drive '{}' already exists", outdrive);
