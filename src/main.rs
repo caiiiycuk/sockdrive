@@ -38,15 +38,16 @@ Usage:
     sockdrive sockify <jsdos_bundle> <output_dir> <url> <sockified_bundle>
 
     jsdos_bundle: path to the jsdos bundle file (or directory with bundle files)
+    drive_prefix: prefix for generated drives (e.g. 'gamename-')
     output_dir: path to the output directory (where sockdrive files will be placed)
     url: url to the sockdrive server (where you need to put sockdrive files)
     sockified_bundle: path to the resulting jsdos bundle file
     -b: enable brotli compression (brotli cmd should be in PATH)
 
 Example:
-    sockdrive sockify bundle.jsdos ./sockdrive https://my.site bundle-sockified.jsdos [-b]
+    sockdrive sockify bundle.jsdos bundle- ./sockdrive https://my.site bundle-sockified.jsdos [-b]
     OR
-    sockdirve sockify bindle-dir ./sockdrive https://my.site bindle-sockified.jsdos [-b]
+    sockdirve sockify bindle-dir bundle- ./sockdrive https://my.site bindle-sockified.jsdos [-b]
 
 Note:
     in our example you need to publish context of ./s3 folder to your web-server,
@@ -58,9 +59,10 @@ Note:
     }
 
     let jsdos_bundle = &args[2];
-    let output_dir = &args[3];
-    let url = &args[4];
-    let sockified_bundle = &args[5];
+    let drive_prefix = &args[3];
+    let output_dir = &args[4];
+    let url = &args[5];
+    let sockified_bundle = &args[6];
     let temp_dir = format!("{}/sockdrive-temp", output_dir);
 
     let url = if url.ends_with("/") {
@@ -132,7 +134,12 @@ Note:
         let drive = parts[1];
         let path = parts[2];
         let indrive = format!("{}/{}", temp_dir, path);
-        let outdrive = format!("{}/{}", output_dir, &path[..path.len() - ".qcow2".len()]);
+        let outdrive = format!(
+            "{}/{}{}",
+            output_dir,
+            drive_prefix,
+            &path[..path.len() - ".qcow2".len()]
+        );
 
         if std::path::Path::new(&outdrive).exists() {
             eprintln!("Error: drive '{}' already exists", outdrive);
@@ -159,7 +166,10 @@ Note:
             ]);
         }
 
-        dosbox_conf_content[i] = format!("imgmount {} sockdrive {}/{}", drive, url, outdrive);
+        dosbox_conf_content[i] = format!(
+            "imgmount {} sockdrive {}/{}{}",
+            drive, url, drive_prefix, outdrive
+        );
         std::fs::remove_file(&indrive).unwrap();
     }
 
