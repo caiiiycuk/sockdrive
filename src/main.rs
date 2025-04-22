@@ -37,14 +37,16 @@ sockdrive cli: sockify
 Usage:
     sockdrive sockify <jsdos_bundle> <output_dir> <url> <sockified_bundle>
 
-    jsdos_bundle: path to the jsdos bundle file
+    jsdos_bundle: path to the jsdos bundle file (or directory with bundle files)
     output_dir: path to the output directory (where sockdrive files will be placed)
     url: url to the sockdrive server (where you need to put sockdrive files)
     sockified_bundle: path to the resulting jsdos bundle file
     -b: enable brotli compression (brotli cmd should be in PATH)
 
 Example:
-    sockdrive sockify jsdos.zip ./sockdrive https://my.site jsdos-sockified.zip [-b]
+    sockdrive sockify bundle.jsdos ./sockdrive https://my.site bundle-sockified.jsdos [-b]
+    OR
+    sockdirve sockify bindle-dir ./sockdrive https://my.site bindle-sockified.jsdos [-b]
 
 Note:
     in our example you need to publish context of ./s3 folder to your web-server,
@@ -87,10 +89,14 @@ Note:
         std::fs::remove_dir_all(&temp_dir).unwrap();
     };
 
-    Command::new("7z")
-        .args(["x", jsdos_bundle, &format!("-o{}", temp_dir)])
-        .status()
-        .unwrap();
+    if std::path::Path::new(jsdos_bundle).is_dir() {
+        copy_dir_all(jsdos_bundle, &temp_dir).unwrap();
+    } else {
+        Command::new("7z")
+            .args(["x", jsdos_bundle, &format!("-o{}", temp_dir)])
+            .status()
+            .unwrap();
+    }
 
     let dosbox_conf = format!("{}/.jsdos/dosbox.conf", temp_dir);
     if !std::path::Path::new(&dosbox_conf).exists() {
@@ -610,4 +616,21 @@ mod tests {
             preload_ranges
         );
     }
+}
+
+fn copy_dir_all(
+    src: impl AsRef<std::path::Path>,
+    dst: impl AsRef<std::path::Path>,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(&dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        } else {
+            std::fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        }
+    }
+    Ok(())
 }
