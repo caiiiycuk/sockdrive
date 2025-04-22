@@ -139,7 +139,10 @@ Note:
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let outdrive = format!("{}/{}{}", output_dir, drive_prefix, outname);
+        let outname = format!("{}{}", drive_prefix, outname);
+        let outdrive = format!("{}/{}", output_dir, outname);
+
+        println!("outdrive: {}, outname: {}", outdrive, outname);
 
         if std::path::Path::new(&outdrive).exists() {
             eprintln!("Error: drive '{}' already exists", outdrive);
@@ -168,7 +171,7 @@ Note:
 
         dosbox_conf_content[i] = format!(
             "imgmount {} sockdrive {}/{}{}",
-            drive, url, drive_prefix, outdrive
+            drive, url, drive_prefix, outname
         );
         std::fs::remove_file(&indrive).unwrap();
     }
