@@ -36,3 +36,4 @@ jobs:
         files: |
           ${{github.workspace}}/target/x86_64-unknown-linux-musl/release/cli
           ${{github.workspace}}/target/x86_64-unknown-linux-musl/release/cli.d
+          ${{github.workspace}}/etc/boot.img

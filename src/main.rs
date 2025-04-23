@@ -230,6 +230,29 @@ Example:
     }
 
     let input_file = if input_file.ends_with(".qcow2") || input_file.ends_with(".qcow") {
+        println!("Scanning the qcow2 image for errors");
+        let boot_img = format!(
+            "{}/boot.img",
+            std::env::current_exe().unwrap().parent().unwrap().display()
+        );
+        if !std::path::Path::new(&boot_img).exists() {
+            eprintln!("Error: boot.img '{}' does not exist", boot_img);
+            std::process::exit(1);
+        }
+        Command::new("qemu-system-i386")
+            .args([
+                "-boot",
+                "a",
+                "-fda",
+                &boot_img,
+                "-hda",
+                input_file,
+                "-display", "none",
+                "--no-reboot",
+            ])
+            .status()
+            .expect("Failed to run qemu scandisk");
+
         println!("Converting qcow2 image to raw image");
         let raw = format!("{}.raw", input_file);
         Command::new("virt-sparsify")
