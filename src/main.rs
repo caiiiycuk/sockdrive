@@ -43,11 +43,12 @@ Usage:
     url: url to the sockdrive server (where you need to put sockdrive files)
     sockified_bundle: path to the resulting jsdos bundle file
     -b: enable brotli compression (brotli cmd should be in PATH)
+    -g: enable gzip compression (gzip cmd should be in PATH)
 
 Example:
-    sockdrive sockify bundle.jsdos bundle- ./sockdrive https://my.site bundle-sockified.jsdos [-b]
+    sockdrive sockify bundle.jsdos bundle- ./sockdrive https://my.site bundle-sockified.jsdos [-b] [-g]
     OR
-    sockdirve sockify bindle-dir bundle- ./sockdrive https://my.site bindle-sockified.jsdos [-b]
+    sockdrive sockify bindle-dir bundle- ./sockdrive https://my.site bindle-sockified.jsdos [-b] [-g]
 
 Note:
     in our example you need to publish context of ./s3 folder to your web-server,
@@ -117,7 +118,7 @@ Note:
         .map(|(i, line)| (i, line.clone()))
         .collect();
 
-    if imgmount_lines.len() == 0 {
+    if imgmount_lines.is_empty() {
         eprintln!("Error: qcow2 mounts not found in dosbox.conf");
         cleanup();
         std::process::exit(1);
@@ -150,14 +151,18 @@ Note:
             std::process::exit(1);
         }
 
-        if args.contains(&"-b".to_string()) {
+        if args.contains(&"-b".to_string()) || args.contains(&"-g".to_string()) {
             mkd(vec![
                 "_".to_string(),
                 "mkd".to_string(),
                 indrive.clone(),
                 "_".to_string(),
                 outdrive.clone(),
-                "-b".to_string(),
+                if args.contains(&"-b".to_string()) {
+                    "-b".to_string()
+                } else {
+                    "-g".to_string()
+                },
             ]);
         } else {
             mkd(vec![
@@ -202,6 +207,7 @@ Usage:
     preload_ranges: comma separated list of ranges to preload on startup (range is index, range size is AHEAD_READ_SIZE(256 * 1024))
     output_dir: path to the output directory
     -b: enable brotli compression (brotli cmd should be in PATH)
+    -g: enable gzip compression (gzip cmd should be in PATH)
 
 Note 1:
     use '_' as a default preload ranges
@@ -214,7 +220,7 @@ Note 2:
     https://askubuntu.com/questions/1046828/how-to-run-libguestfs-tools-tools-such-as-virt-make-fs-without-sudo
 
 Example:
-    sockdrive mkd win95v1.raw _ ./output [-b]
+    sockdrive mkd win95v1.raw _ ./output [-b] [-g]
         "
         );
         std::process::exit(1);
@@ -247,7 +253,8 @@ Example:
                 &boot_img,
                 "-hda",
                 input_file,
-                "-display", "none",
+                "-display",
+                "none",
                 "--no-reboot",
             ])
             .status()
@@ -338,8 +345,11 @@ Example:
     );
 
     if args.contains(&"-b".to_string()) {
-        brotli_all(output_dir);
-        reduce_small_files(output_dir, &mut config);
+        compress_all(output_dir, "brotli", "-Z", "-0", "br");
+        reduce_small_files(output_dir, &mut config, "brotli", "-Z", "br");
+    } else if args.contains(&"-g".to_string()) {
+        compress_all(output_dir, "gzip", "-9", "-1", "gz");
+        reduce_small_files(output_dir, &mut config, "gzip", "-9", "gz");
     }
 
     if args[2] != input_file {
@@ -374,21 +384,38 @@ fn mkahead(raw_image: &str, range_count: u32, output_dir: &str) -> Vec<u32> {
     dropped
 }
 
-fn brotli_all(output_dir: &str) {
+fn compress_all(
+    output_dir: &str,
+    compression_cmd: &str,
+    compression_best: &str,
+    compression_fast: &str,
+    compression_suffix: &str,
+) {
     let files: Vec<_> = read_dir(output_dir).unwrap().flatten().collect();
     let num_cpus = num_cpus::get();
     let chunks = files.chunks(files.len().div_ceil(num_cpus));
 
     let total = chunks.len();
+    let compression_cmd = compression_cmd.to_string();
+    let compression_best = compression_best.to_string();
+    let compression_fast = compression_fast.to_string();
+    let compression_suffix = compression_suffix.to_string();
+
     println!("Compressing {} files on {} CPUs", files.len(), num_cpus);
     chunks.enumerate().for_each(|(i, chunk)| {
         let handles: Vec<_> = chunk
             .iter()
             .map(|file| {
                 let path = file.path();
+                let compression_cmd = compression_cmd.clone();
+                let compression_best = compression_best.clone();
+                let compression_fast = compression_fast.clone();
+                let compression_suffix = compression_suffix.clone();
+
                 std::thread::spawn(move || {
-                    let status = Command::new("brotli")
-                        .arg("-Zk")
+                    let status = Command::new(&compression_cmd)
+                        .arg(compression_best)
+                        .arg("-k")
                         .arg(&path)
                         .status()
                         .unwrap();
@@ -398,23 +425,24 @@ fn brotli_all(output_dir: &str) {
                         std::process::exit(1);
                     }
 
-                    let br_path = format!("{}.br", &path.display());
+                    let compressed_path = format!("{}.{}", &path.display(), compression_suffix);
                     let orig_size = metadata(&path).unwrap().len();
-                    let br_size = match metadata(&br_path) {
+                    let compressed_size = match metadata(&compressed_path) {
                         Ok(meta) => meta.len(),
                         Err(_) => {
-                            println!("Failed to get metadata for {:?}", br_path);
+                            println!("Failed to get metadata for {:?}", compressed_path);
                             std::process::exit(1);
                         }
                     };
 
-                    if br_size < orig_size {
+                    if compressed_size < orig_size {
                         remove_file(&path).unwrap();
-                        rename(br_path, path).unwrap();
+                        rename(compressed_path, path).unwrap();
                     } else {
-                        remove_file(&br_path).unwrap();
-                        let status = Command::new("brotli")
-                            .arg("-0k")
+                        remove_file(&compressed_path).unwrap();
+                        let status = Command::new(compression_cmd)
+                            .arg(compression_fast)
+                            .arg("-k")
                             .arg(&path)
                             .status()
                             .unwrap();
@@ -425,7 +453,7 @@ fn brotli_all(output_dir: &str) {
                         }
 
                         remove_file(&path).unwrap();
-                        rename(br_path, path).unwrap();
+                        rename(compressed_path, path).unwrap();
                     }
                 })
             })
@@ -439,7 +467,13 @@ fn brotli_all(output_dir: &str) {
     });
 }
 
-fn reduce_small_files(output_dir: &str, metaj: &mut serde_json::Value) {
+fn reduce_small_files(
+    output_dir: &str,
+    metaj: &mut serde_json::Value,
+    compression_cmd: &str,
+    compression_best: &str,
+    compression_suffix: &str,
+) {
     let files: Vec<_> = read_dir(output_dir).unwrap().flatten().collect();
     let mut all_files = Vec::new();
 
@@ -475,17 +509,16 @@ fn reduce_small_files(output_dir: &str, metaj: &mut serde_json::Value) {
         small_files.push(path);
     }
 
-    if small_files.len() > 0 {
+    if !small_files.is_empty() {
         let mut file_locations = Vec::new();
         let mut file_contents = Vec::<u8>::new();
 
         for path in &small_files {
             let decoded_path = format!("{}/decoded.raw", output_dir);
-            let status = Command::new("brotli")
-                .arg("-dk")
-                .arg(&path)
-                .arg("-o")
-                .arg(&decoded_path)
+            let status = Command::new(compression_cmd)
+                .arg("-dkc")
+                .arg(path)
+                .stdout(File::create(&decoded_path).unwrap())
                 .status()
                 .unwrap();
 
@@ -527,8 +560,9 @@ fn reduce_small_files(output_dir: &str, metaj: &mut serde_json::Value) {
             small_files.len() * AHEAD_READ_SIZE as usize / 1024,
             file_contents.len() / 1024);
 
-        let status = Command::new("brotli")
-            .arg("-0k")
+        let status = Command::new(compression_cmd)
+            .arg(compression_best)
+            .arg("-k")
             .arg(&preload_file_str)
             .status()
             .unwrap();
@@ -539,7 +573,11 @@ fn reduce_small_files(output_dir: &str, metaj: &mut serde_json::Value) {
         }
 
         remove_file(&preload_file_str).unwrap();
-        rename(format!("{}/preload.raw.br", output_dir), &preload_file_str).unwrap();
+        rename(
+            format!("{}/preload.raw.{}", output_dir, compression_suffix),
+            &preload_file_str,
+        )
+        .unwrap();
         println!(
             "Preload file size: {} kb",
             metadata(&preload_file_str).unwrap().len() / 1024
@@ -553,8 +591,9 @@ fn reduce_small_files(output_dir: &str, metaj: &mut serde_json::Value) {
         let metaj_file = format!("{}/sockdrive.metaj", output_dir);
         write(&metaj_file, serde_json::to_string(&metaj).unwrap()).unwrap();
 
-        let status = Command::new("brotli")
-            .arg("-Zk")
+        let status = Command::new(compression_cmd)
+            .arg(compression_best)
+            .arg("-k")
             .arg(&metaj_file)
             .status()
             .unwrap();
@@ -565,8 +604,29 @@ fn reduce_small_files(output_dir: &str, metaj: &mut serde_json::Value) {
         }
 
         remove_file(&metaj_file).unwrap();
-        rename(format!("{}/sockdrive.metaj.br", output_dir), metaj_file).unwrap();
+        rename(
+            format!("{}/sockdrive.metaj.{}", output_dir, compression_suffix),
+            metaj_file,
+        )
+        .unwrap();
     }
+}
+
+fn copy_dir_all(
+    src: impl AsRef<std::path::Path>,
+    dst: impl AsRef<std::path::Path>,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(&dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        } else {
+            std::fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -649,21 +709,4 @@ mod tests {
             preload_ranges
         );
     }
-}
-
-fn copy_dir_all(
-    src: impl AsRef<std::path::Path>,
-    dst: impl AsRef<std::path::Path>,
-) -> std::io::Result<()> {
-    std::fs::create_dir_all(&dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        if ty.is_dir() {
-            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
-        } else {
-            std::fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
-        }
-    }
-    Ok(())
 }
