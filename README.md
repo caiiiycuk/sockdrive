@@ -27,4 +27,8 @@ Binaries
 
 Download binaries from [releases](https://github.com/caiiiycuk/sockdrive/releases).
 
-Follow cli instructions.
+
+How to use
+==========
+
+Follow [js-dos documentation](https://js-dos.com/publish-sockdrive-bundle.html)
