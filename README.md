@@ -9,7 +9,7 @@ Host requirments
 Install following packages:
 
 ```sh
-sudo apt install guestfs-tools brotli qemu-system-i386 qemu-utils 7zip
+sudo apt install guestfs-tools brotli curl gzip qemu-system-i386 qemu-utils 7zip
 ```
 
 For working with qcow2 images you must change permission of `/boot/vmlinuz-*`:
