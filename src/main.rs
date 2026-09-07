@@ -2,11 +2,12 @@ use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir, create_dir_all, metadata, read_dir, remove_file, rename, write, File};
 use std::io::{Read, Seek, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+mod doctor;
+mod fat32;
 
 const AHEAD_READ_SIZE: u64 = 256 * 1024;
 const FAT16_256MB: &str = include_str!("../drives/fat16-256mb.json");
@@ -16,7 +17,9 @@ const DEFAULT_PRELOAD: &str = "0,16,1,52,50,68,51,145,280,152,291,227,234,226,20
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 || (args[1] != "mkd" && args[1] != "sockify" && args[1] != "restore") {
+    if args.len() < 2
+        || (args[1] != "mkd" && args[1] != "sockify" && args[1] != "doctor" && args[1] != "docktor")
+    {
         eprintln!(
             "
 sockdrive cl
@@ -24,314 +27,42 @@ sockdrive cl
 Use one of the following commands:
     sockdrive mkd   - make sockdrive from raw / qcow2 image
     sockdrive sockify - transform jsdos bundle with qcow2 images to use sockdrive
-    sockdrive restore - restore sockdrive mounts from jsdos bundle to qcow2 images
+    sockdrive doctor - download, inspect and patch sockdrive mounts
             "
         );
     } else if args[1] == "mkd" {
         mkd(args);
     } else if args[1] == "sockify" {
         sockify(args);
-    } else if args[1] == "restore" {
-        restore(args);
+    } else if args[1] == "doctor" || args[1] == "docktor" {
+        doctor::doctor(args);
     }
 }
 
 #[derive(Clone, Debug)]
-struct SockdriveMount {
-    drive: String,
-    url: String,
+pub(crate) struct SockdriveMount {
+    pub(crate) drive: String,
+    pub(crate) url: String,
 }
 
 #[derive(Clone, Debug)]
-struct SockdriveMeta {
-    size_kb: u64,
-    ahead_read: u64,
-    range_count: u64,
-    sector_size: u64,
-    dropped_ranges: Vec<u32>,
-    small_ranges: Vec<u32>,
+pub(crate) struct SockdriveMeta {
+    pub(crate) size_kb: u64,
+    pub(crate) ahead_read: u64,
+    pub(crate) range_count: u64,
+    pub(crate) sector_size: u64,
+    pub(crate) dropped_ranges: Vec<u32>,
+    pub(crate) small_ranges: Vec<u32>,
 }
 
-fn restore(args: Vec<String>) {
-    if args.len() < 4 || args.len() > 5 || args[1] != "restore" {
-        eprintln!(
-            "
-sockdrive cli: restore
-
-Usage:
-    sockdrive restore <jsdos_bundle> <output_dir> [changes.bin]
-
-    jsdos_bundle: path to a jsdos bundle containing sockdrive mounts
-    output_dir: directory where restored qcow2 images will be placed, must not exist
-    changes.bin: optional sockdrive changes file exported by js-dos
-
-Example:
-    sockdrive restore bundle.jsdos ./restored changes.bin
-        "
-        );
-        std::process::exit(1);
-    }
-
-    let jsdos_bundle = &args[2];
-    let output_dir = Path::new(&args[3]);
-    let changes_file = args.get(4);
-
-    if !Path::new(jsdos_bundle).exists() {
-        eprintln!("Error: jsdos bundle '{}' does not exist", jsdos_bundle);
-        std::process::exit(1);
-    }
-
-    if output_dir.exists() {
-        eprintln!("Error: output directory '{}' exists", output_dir.display());
-        std::process::exit(1);
-    }
-
-    let changes = match changes_file {
-        Some(path) => {
-            if !Path::new(path).exists() {
-                eprintln!("Error: changes file '{}' does not exist", path);
-                std::process::exit(1);
-            }
-            parse_sockdrive_changes(&std::fs::read(path).unwrap_or_else(|e| {
-                eprintln!("Error: failed to read changes file '{}': {}", path, e);
-                std::process::exit(1);
-            }))
-            .unwrap_or_else(|e| {
-                eprintln!("Error: invalid changes file '{}': {}", path, e);
-                std::process::exit(1);
-            })
-        }
-        None => HashMap::new(),
-    };
-
-    create_dir_all(output_dir).unwrap();
-    let temp_dir = output_dir.join("sockdrive-restore-temp");
-    create_dir_all(&temp_dir).unwrap();
-
-    let cleanup = || {
-        if temp_dir.exists() {
-            std::fs::remove_dir_all(&temp_dir).unwrap();
-        }
-    };
-
-    if Path::new(jsdos_bundle).is_dir() {
-        copy_dir_all(jsdos_bundle, &temp_dir).unwrap();
-    } else {
-        let status = Command::new("7z")
-            .args(["x", jsdos_bundle, &format!("-o{}", temp_dir.display())])
-            .status()
-            .expect("Failed to run 7z");
-        if !status.success() {
-            eprintln!("Error: failed to extract jsdos bundle '{}'", jsdos_bundle);
-            cleanup();
-            std::process::exit(1);
-        }
-    }
-
-    let dosbox_conf = temp_dir.join(".jsdos/dosbox.conf");
-    if !dosbox_conf.exists() {
-        eprintln!(
-            "Error: dosbox.conf '{}' does not exist",
-            dosbox_conf.display()
-        );
-        cleanup();
-        std::process::exit(1);
-    }
-
-    let dosbox_conf_content = std::fs::read_to_string(&dosbox_conf).unwrap();
-    let mounts = find_sockdrive_mounts(&dosbox_conf_content);
-    if mounts.is_empty() {
-        eprintln!("Error: sockdrive mounts not found in dosbox.conf");
-        cleanup();
-        std::process::exit(1);
-    }
-
-    copy_bundle_payload(&temp_dir, output_dir).unwrap_or_else(|e| {
-        eprintln!(
-            "Error: failed to copy jsdos bundle payload to '{}': {}",
-            output_dir.display(),
-            e
-        );
-        cleanup();
-        std::process::exit(1);
-    });
-
-    let mut used_names = HashSet::new();
-    let mut restored_mounts = Vec::new();
-    for (index, mount) in mounts.iter().enumerate() {
-        let basename = unique_restore_name(index, mount, &mut used_names);
-        let qcow2_name = format!("{}.qcow2", basename);
-        let drive_temp_dir = temp_dir.join(format!("drive-{}", index));
-        create_dir_all(&drive_temp_dir).unwrap();
-        let raw_path = drive_temp_dir.join(format!("{}.raw", basename));
-        let qcow2_path = output_dir.join(&qcow2_name);
-
-        println!("Restoring {} to {}", mount.url, qcow2_path.display());
-        restore_sockdrive_raw(
-            &mount.url,
-            &raw_path,
-            &drive_temp_dir,
-            changes.get(&mount.url).map(|v| v.as_slice()),
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("Error: failed to restore '{}': {}", mount.url, e);
-            cleanup();
-            std::process::exit(1);
-        });
-
-        convert_raw_to_qcow2(&raw_path, &qcow2_path).unwrap_or_else(|e| {
-            eprintln!("Error: failed to convert '{}': {}", raw_path.display(), e);
-            cleanup();
-            std::process::exit(1);
-        });
-
-        run_qemu_scandisk(&qcow2_path).unwrap_or_else(|e| {
-            eprintln!(
-                "Error: qemu scandisk failed for '{}': {}",
-                qcow2_path.display(),
-                e
-            );
-            cleanup();
-            std::process::exit(1);
-        });
-
-        restored_mounts.push((mount.clone(), qcow2_name));
-    }
-
-    for url in changes.keys() {
-        if !mounts.iter().any(|mount| &mount.url == url) {
-            eprintln!("Warning: changes for '{}' were not used", url);
-        }
-    }
-
-    let restored_dosbox_conf = replace_sockdrive_mounts(&dosbox_conf_content, &restored_mounts)
-        .unwrap_or_else(|e| {
-            eprintln!("Error: failed to rewrite dosbox.conf: {}", e);
-            cleanup();
-            std::process::exit(1);
-        });
-    let output_dosbox_conf = output_dir.join(".jsdos/dosbox.conf");
-    std::fs::write(&output_dosbox_conf, restored_dosbox_conf).unwrap_or_else(|e| {
-        eprintln!(
-            "Error: failed to write '{}': {}",
-            output_dosbox_conf.display(),
-            e
-        );
-        cleanup();
-        std::process::exit(1);
-    });
-
-    cleanup();
-    let restored_bundle = pack_restored_jsdos(jsdos_bundle, output_dir, &restored_mounts)
-        .unwrap_or_else(|e| {
-            eprintln!("Error: failed to pack restored jsdos bundle: {}", e);
-            std::process::exit(1);
-        });
-    println!(
-        "Done, restored {} qcow2 image(s) in {}, bundle {}",
-        mounts.len(),
-        output_dir.display(),
-        restored_bundle.display()
-    );
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StoredEncoding {
+    Plain,
+    Gzip,
+    Brotli,
 }
 
-fn copy_bundle_payload(src: &Path, dst: &Path) -> Result<(), String> {
-    for entry in read_dir(src).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let target = dst.join(entry.file_name());
-        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
-            copy_dir_all(entry.path(), target).map_err(|e| e.to_string())?;
-        } else {
-            std::fs::copy(entry.path(), target).map_err(|e| e.to_string())?;
-        }
-    }
-
-    Ok(())
-}
-
-fn replace_sockdrive_mounts(
-    dosbox_conf: &str,
-    restored_mounts: &[(SockdriveMount, String)],
-) -> Result<String, String> {
-    let mut used = vec![false; restored_mounts.len()];
-    let mut replaced = 0usize;
-    let mut lines = Vec::new();
-
-    for line in dosbox_conf.lines() {
-        let trimmed = line.trim_start();
-        let indent_len = line.len() - trimmed.len();
-        let indent = &line[..indent_len];
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-
-        if parts.len() >= 4 && parts[0] == "imgmount" && parts[2] == "sockdrive" {
-            let drive = parts[1];
-            let url = normalize_sockdrive_url(parts[3]);
-            if let Some((index, (_, qcow2_name))) =
-                restored_mounts
-                    .iter()
-                    .enumerate()
-                    .find(|(index, (mount, _))| {
-                        !used[*index] && mount.drive == drive && mount.url == url
-                    })
-            {
-                used[index] = true;
-                replaced += 1;
-                lines.push(format!("{}imgmount {} {}", indent, drive, qcow2_name));
-                continue;
-            }
-        }
-
-        lines.push(line.to_string());
-    }
-
-    if replaced != restored_mounts.len() {
-        return Err(format!(
-            "replaced {} sockdrive mount(s), expected {}",
-            replaced,
-            restored_mounts.len()
-        ));
-    }
-
-    Ok(lines.join("\n"))
-}
-
-fn pack_restored_jsdos(
-    jsdos_bundle: &str,
-    output_dir: &Path,
-    restored_mounts: &[(SockdriveMount, String)],
-) -> Result<PathBuf, String> {
-    let source_name = Path::new(jsdos_bundle)
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("restored");
-    let archive_name = format!("{}.restored.jsdos", source_name);
-    let archive_path = output_dir.join(&archive_name);
-    if archive_path.exists() {
-        return Err(format!(
-            "archive '{}' already exists",
-            archive_path.display()
-        ));
-    }
-
-    let mut command = Command::new("7z");
-    command.current_dir(output_dir);
-    command.args(["a", "-tzip", "-mx0", &archive_name, ".jsdos"]);
-    for (_, qcow2_name) in restored_mounts {
-        command.arg(qcow2_name);
-    }
-
-    let status = command
-        .status()
-        .map_err(|e| format!("failed to run 7z: {}", e))?;
-    if !status.success() {
-        return Err("7z failed".to_string());
-    }
-
-    Ok(archive_path)
-}
-
-fn find_sockdrive_mounts(dosbox_conf: &str) -> Vec<SockdriveMount> {
+pub(crate) fn find_sockdrive_mounts(dosbox_conf: &str) -> Vec<SockdriveMount> {
     dosbox_conf
         .lines()
         .filter_map(|line| {
@@ -353,7 +84,7 @@ fn find_sockdrive_mounts(dosbox_conf: &str) -> Vec<SockdriveMount> {
         .collect()
 }
 
-fn normalize_sockdrive_url(url: &str) -> String {
+pub(crate) fn normalize_sockdrive_url(url: &str) -> String {
     let mut normalized = url
         .replace(
             "wss://sockdrive.js-dos.com:8001/dos.zone/",
@@ -371,38 +102,7 @@ fn normalize_sockdrive_url(url: &str) -> String {
     normalized
 }
 
-fn unique_restore_name(
-    index: usize,
-    mount: &SockdriveMount,
-    used_names: &mut HashSet<String>,
-) -> String {
-    let raw_name = mount
-        .url
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or("sockdrive");
-    let mut name = sanitize_filename(raw_name);
-    if name.is_empty() {
-        name = format!("sockdrive-{}", index);
-    }
-
-    if used_names.insert(name.clone()) {
-        return name;
-    }
-
-    let mut candidate = format!("{}-{}", mount.drive, name);
-    candidate = sanitize_filename(&candidate);
-    if used_names.insert(candidate.clone()) {
-        return candidate;
-    }
-
-    let candidate = format!("{}-{}", candidate, index);
-    used_names.insert(candidate.clone());
-    candidate
-}
-
-fn sanitize_filename(name: &str) -> String {
+pub(crate) fn sanitize_filename(name: &str) -> String {
     name.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
@@ -414,175 +114,7 @@ fn sanitize_filename(name: &str) -> String {
         .collect()
 }
 
-fn restore_sockdrive_raw(
-    url: &str,
-    raw_path: &Path,
-    temp_dir: &Path,
-    changes: Option<&[u8]>,
-) -> Result<(), String> {
-    let meta_path = temp_dir.join("sockdrive.metaj.download");
-    download_sockdrive_file(url, "sockdrive.metaj", &meta_path)?;
-    let meta_bytes = decode_downloaded_json(&meta_path)?;
-    let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
-        .map_err(|e| format!("invalid sockdrive.metaj JSON: {}", e))?;
-    let meta = parse_sockdrive_meta(&meta)?;
-    validate_sockdrive_meta(&meta)?;
-
-    let raw_size = meta.size_kb * 1024;
-    let mut raw = File::create(raw_path).map_err(|e| e.to_string())?;
-    raw.set_len(raw_size).map_err(|e| e.to_string())?;
-
-    let dropped: HashSet<u32> = meta.dropped_ranges.iter().copied().collect();
-    let small: HashSet<u32> = meta.small_ranges.iter().copied().collect();
-    let preload = if meta.small_ranges.is_empty() {
-        Vec::new()
-    } else {
-        let preload_path = temp_dir.join("preload.raw.download");
-        download_sockdrive_file(url, "preload.raw", &preload_path)?;
-        decode_downloaded_len(
-            &preload_path,
-            meta.small_ranges.len() * meta.ahead_read as usize,
-        )?
-    };
-
-    let mut normal_ranges = Vec::new();
-    for range in 0..meta.range_count {
-        let range_u32 = range as u32;
-        let offset = range * meta.ahead_read;
-        if offset >= raw_size || dropped.contains(&range_u32) {
-            continue;
-        }
-
-        let source =
-            if let Some(small_index) = meta.small_ranges.iter().position(|r| *r == range_u32) {
-                let start = small_index * meta.ahead_read as usize;
-                let end = start + meta.ahead_read as usize;
-                &preload[start..end]
-            } else if small.contains(&range_u32) {
-                return Err(format!("small range {} is duplicated", range));
-            } else {
-                normal_ranges.push(range);
-                continue;
-            };
-
-        let write_len = min(meta.ahead_read, raw_size - offset) as usize;
-        raw.seek(std::io::SeekFrom::Start(offset))
-            .map_err(|e| e.to_string())?;
-        raw.write_all(&source[..write_len])
-            .map_err(|e| e.to_string())?;
-    }
-
-    restore_sockdrive_ranges_parallel(
-        url,
-        raw,
-        temp_dir,
-        &normal_ranges,
-        meta.ahead_read,
-        raw_size,
-    )?;
-
-    if let Some(changes) = changes {
-        apply_sockdrive_changes(raw_path, changes, &meta)?;
-    }
-
-    Ok(())
-}
-
-fn restore_sockdrive_ranges_parallel(
-    url: &str,
-    raw: File,
-    temp_dir: &Path,
-    ranges: &[u64],
-    ahead_read: u64,
-    raw_size: u64,
-) -> Result<(), String> {
-    if ranges.is_empty() {
-        return Ok(());
-    }
-
-    let workers = min(8, ranges.len());
-    let queue = Arc::new(Mutex::new(std::collections::VecDeque::from(
-        ranges.to_vec(),
-    )));
-    let raw = Arc::new(Mutex::new(raw));
-    let error = Arc::new(Mutex::new(None::<String>));
-    let completed = Arc::new(AtomicUsize::new(0));
-    let total = ranges.len();
-    let mut handles = Vec::new();
-
-    eprintln!(
-        "Downloading {} sockdrive ranges with {} workers",
-        total, workers
-    );
-
-    for _ in 0..workers {
-        let url = url.to_string();
-        let temp_dir = temp_dir.to_path_buf();
-        let queue = Arc::clone(&queue);
-        let raw = Arc::clone(&raw);
-        let error = Arc::clone(&error);
-        let completed = Arc::clone(&completed);
-
-        handles.push(thread::spawn(move || loop {
-            if error.lock().unwrap().is_some() {
-                break;
-            }
-
-            let Some(range) = queue.lock().unwrap().pop_front() else {
-                break;
-            };
-
-            if let Err(e) =
-                restore_sockdrive_range(&url, &temp_dir, &raw, range, ahead_read, raw_size)
-            {
-                *error.lock().unwrap() = Some(e);
-                break;
-            }
-
-            let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
-            if done == total || done % 100 == 0 {
-                eprintln!("Restored {}/{} sockdrive ranges", done, total);
-            }
-        }));
-    }
-
-    for handle in handles {
-        handle
-            .join()
-            .map_err(|_| "sockdrive range worker panicked".to_string())?;
-    }
-
-    if let Some(error) = error.lock().unwrap().take() {
-        return Err(error);
-    }
-
-    Ok(())
-}
-
-fn restore_sockdrive_range(
-    url: &str,
-    temp_dir: &Path,
-    raw: &Arc<Mutex<File>>,
-    range: u64,
-    ahead_read: u64,
-    raw_size: u64,
-) -> Result<(), String> {
-    let range_path = temp_dir.join(format!("{}.raw.download", range));
-    download_sockdrive_file(url, &format!("{}.raw", range), &range_path)?;
-    let data = decode_downloaded_len(&range_path, ahead_read as usize)?;
-    let offset = range * ahead_read;
-    let write_len = min(ahead_read, raw_size - offset) as usize;
-
-    let mut raw = raw.lock().unwrap();
-    raw.seek(std::io::SeekFrom::Start(offset))
-        .map_err(|e| e.to_string())?;
-    raw.write_all(&data[..write_len])
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
-}
-
-fn parse_sockdrive_meta(meta: &serde_json::Value) -> Result<SockdriveMeta, String> {
+pub(crate) fn parse_sockdrive_meta(meta: &serde_json::Value) -> Result<SockdriveMeta, String> {
     Ok(SockdriveMeta {
         size_kb: required_u64(meta, "size")?,
         ahead_read: required_u64(meta, "ahead_read")?,
@@ -599,7 +131,10 @@ fn required_u64(meta: &serde_json::Value, field: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("sockdrive.metaj field '{}' is missing or invalid", field))
 }
 
-fn optional_u32_array(meta: &serde_json::Value, field: &str) -> Result<Vec<u32>, String> {
+pub(crate) fn optional_u32_array(
+    meta: &serde_json::Value,
+    field: &str,
+) -> Result<Vec<u32>, String> {
     let Some(value) = meta.get(field) else {
         return Ok(Vec::new());
     };
@@ -617,7 +152,7 @@ fn optional_u32_array(meta: &serde_json::Value, field: &str) -> Result<Vec<u32>,
         .collect()
 }
 
-fn validate_sockdrive_meta(meta: &SockdriveMeta) -> Result<(), String> {
+pub(crate) fn validate_sockdrive_meta(meta: &SockdriveMeta) -> Result<(), String> {
     if meta.size_kb == 0 {
         return Err("sockdrive.metaj size should be greater than zero".to_string());
     }
@@ -652,7 +187,7 @@ fn validate_sockdrive_meta(meta: &SockdriveMeta) -> Result<(), String> {
     Ok(())
 }
 
-fn download_sockdrive_file(url: &str, name: &str, output: &Path) -> Result<(), String> {
+pub(crate) fn download_sockdrive_file(url: &str, name: &str, output: &Path) -> Result<(), String> {
     let file_url = format!("{}/{}", url, name);
     let status = Command::new("curl")
         .args([
@@ -677,43 +212,53 @@ fn download_sockdrive_file(url: &str, name: &str, output: &Path) -> Result<(), S
     Ok(())
 }
 
-fn decode_downloaded_json(path: &Path) -> Result<Vec<u8>, String> {
-    for candidate in decode_candidates(path)? {
+pub(crate) fn decode_json_file(path: &Path) -> Result<(Vec<u8>, StoredEncoding), String> {
+    for (candidate, encoding) in decode_candidates(path)? {
         if serde_json::from_slice::<serde_json::Value>(&candidate).is_ok() {
-            return Ok(candidate);
+            return Ok((candidate, encoding));
         }
     }
 
-    Err(format!(
-        "downloaded file '{}' is not valid JSON",
-        path.display()
-    ))
+    Err(format!("file '{}' is not valid JSON", path.display()))
 }
 
-fn decode_downloaded_len(path: &Path, expected_len: usize) -> Result<Vec<u8>, String> {
-    for candidate in decode_candidates(path)? {
+pub(crate) fn decode_file_len(
+    path: &Path,
+    expected_len: usize,
+) -> Result<(Vec<u8>, StoredEncoding), String> {
+    let candidates = decode_candidates(path)?;
+    for (candidate, encoding) in candidates
+        .iter()
+        .filter(|(_, encoding)| *encoding != StoredEncoding::Plain)
+    {
         if candidate.len() == expected_len {
-            return Ok(candidate);
+            return Ok((candidate.clone(), *encoding));
+        }
+    }
+
+    for (candidate, encoding) in candidates {
+        if candidate.len() == expected_len {
+            return Ok((candidate, encoding));
         }
     }
 
     Err(format!(
-        "downloaded file '{}' does not decode to expected size {}",
+        "file '{}' does not decode to expected size {}",
         path.display(),
         expected_len
     ))
 }
 
-fn decode_candidates(path: &Path) -> Result<Vec<Vec<u8>>, String> {
+fn decode_candidates(path: &Path) -> Result<Vec<(Vec<u8>, StoredEncoding)>, String> {
     let original = std::fs::read(path).map_err(|e| e.to_string())?;
-    let mut candidates = vec![original];
+    let mut candidates = vec![(original, StoredEncoding::Plain)];
 
     if let Some(decoded) = decode_with_command("gzip", &["-d", "-c"], path)? {
-        candidates.push(decoded);
+        candidates.push((decoded, StoredEncoding::Gzip));
     }
 
     if let Some(decoded) = decode_with_command("brotli", &["-d", "-c"], path)? {
-        candidates.push(decoded);
+        candidates.push((decoded, StoredEncoding::Brotli));
     }
 
     Ok(candidates)
@@ -733,7 +278,62 @@ fn decode_with_command(cmd: &str, args: &[&str], path: &Path) -> Result<Option<V
     }
 }
 
-fn parse_sockdrive_changes(encoded: &[u8]) -> Result<HashMap<String, Vec<u8>>, String> {
+pub(crate) fn encode_file(
+    path: &Path,
+    data: &[u8],
+    encoding: StoredEncoding,
+) -> Result<(), String> {
+    match encoding {
+        StoredEncoding::Plain => std::fs::write(path, data).map_err(|e| e.to_string()),
+        StoredEncoding::Gzip => encode_file_with_command(path, data, "gzip", "-9", "gz"),
+        StoredEncoding::Brotli => encode_file_with_command(path, data, "brotli", "-Z", "br"),
+    }
+}
+
+fn encode_file_with_command(
+    path: &Path,
+    data: &[u8],
+    command_name: &str,
+    compression_arg: &str,
+    suffix: &str,
+) -> Result<(), String> {
+    let tmp = path.with_extension(format!(
+        "encode-tmp-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let compressed_tmp = tmp.with_extension(format!(
+        "{}.{}",
+        tmp.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("encode-tmp"),
+        suffix
+    ));
+
+    std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
+    let status = Command::new(command_name)
+        .arg(compression_arg)
+        .arg("-k")
+        .arg(&tmp)
+        .status()
+        .map_err(|e| format!("failed to run {}: {}", command_name, e))?;
+    if !status.success() {
+        let _ = remove_file(&tmp);
+        return Err(format!("{} failed", command_name));
+    }
+
+    if path.exists() {
+        remove_file(path).map_err(|e| e.to_string())?;
+    }
+    rename(&compressed_tmp, path).map_err(|e| e.to_string())?;
+    remove_file(&tmp).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn parse_sockdrive_changes(encoded: &[u8]) -> Result<HashMap<String, Vec<u8>>, String> {
     let mut changes = HashMap::new();
     let mut offset = 0usize;
     while offset < encoded.len() {
@@ -769,7 +369,7 @@ fn parse_sockdrive_changes(encoded: &[u8]) -> Result<HashMap<String, Vec<u8>>, S
     Ok(changes)
 }
 
-fn apply_sockdrive_changes(
+pub(crate) fn apply_sockdrive_changes(
     raw_path: &Path,
     changes: &[u8],
     meta: &SockdriveMeta,
@@ -914,7 +514,7 @@ fn lz4_uncompress(input: &[u8], output_len: usize) -> Result<Vec<u8>, String> {
     Ok(output[..j].to_vec())
 }
 
-fn convert_raw_to_qcow2(raw_path: &Path, qcow2_path: &Path) -> Result<(), String> {
+pub(crate) fn convert_raw_to_qcow2(raw_path: &Path, qcow2_path: &Path) -> Result<(), String> {
     let status = Command::new("qemu-img")
         .args([
             "convert",
@@ -933,53 +533,6 @@ fn convert_raw_to_qcow2(raw_path: &Path, qcow2_path: &Path) -> Result<(), String
     }
 
     Ok(())
-}
-
-fn run_qemu_scandisk(image_path: &Path) -> Result<(), String> {
-    let boot_img = find_boot_img()?;
-    let floppy_drive = format!("file={},format=raw,if=floppy", boot_img.display());
-    let hda_drive = format!("file={},format=qcow2,if=ide", image_path.display());
-    let status = Command::new("qemu-system-i386")
-        .args([
-            "-boot",
-            "a",
-            "-drive",
-            &floppy_drive,
-            "-drive",
-            &hda_drive,
-            "-display",
-            "none",
-            "--no-reboot",
-        ])
-        .status()
-        .map_err(|e| format!("failed to run qemu-system-i386: {}", e))?;
-
-    if !status.success() {
-        return Err("qemu-system-i386 failed".to_string());
-    }
-
-    Ok(())
-}
-
-fn find_boot_img() -> Result<PathBuf, String> {
-    let exe_boot_img = std::env::current_exe()
-        .map_err(|e| e.to_string())?
-        .parent()
-        .ok_or_else(|| "failed to find executable directory".to_string())?
-        .join("boot.img");
-    if exe_boot_img.exists() {
-        return Ok(exe_boot_img);
-    }
-
-    let cwd_boot_img = Path::new("etc/boot.img").to_path_buf();
-    if cwd_boot_img.exists() {
-        return Ok(cwd_boot_img);
-    }
-
-    Err(format!(
-        "boot.img '{}' does not exist",
-        exe_boot_img.display()
-    ))
 }
 
 fn sockify(args: Vec<String>) {
@@ -1026,8 +579,8 @@ Note:
         url.to_string()
     };
 
-    let output_dir = if output_dir.starts_with("./") {
-        output_dir[2..].to_string()
+    let output_dir = if let Some(stripped) = output_dir.strip_prefix("./") {
+        stripped.to_string()
     } else {
         output_dir.to_string()
     };
@@ -1566,7 +1119,7 @@ fn reduce_small_files(
     }
 }
 
-fn copy_dir_all(
+pub(crate) fn copy_dir_all(
     src: impl AsRef<std::path::Path>,
     dst: impl AsRef<std::path::Path>,
 ) -> std::io::Result<()> {
@@ -1586,8 +1139,13 @@ fn copy_dir_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::doctor::{
+        doctor_extract_file_to, doctor_output_dir, doctor_patch_file, read_doctor_mount,
+        restore_sockdrive_raw_from_dir, write_doctor_manifest, DoctorMount,
+    };
+    use crate::fat32::{file_data_extents, list_fat32_path, read_fat32_info, resolve_fat32_path};
     use std::fs::remove_dir_all;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn test_fat16_256mb_exists() {
@@ -1685,22 +1243,6 @@ imgmount c sockdrive wss://sockdrive.js-dos.com:8001/system/win95
     }
 
     #[test]
-    fn restore_rewrites_sockdrive_mounts_to_qcow2() {
-        let conf = "[autoexec]\n  imgmount 2 sockdrive https://example.test/drive/\nboot -l c";
-        let mounts = vec![(
-            SockdriveMount {
-                drive: "2".to_string(),
-                url: "https://example.test/drive".to_string(),
-            },
-            "drive.qcow2".to_string(),
-        )];
-
-        let rewritten = replace_sockdrive_mounts(conf, &mounts).unwrap();
-
-        assert_eq!(rewritten, "[autoexec]\n  imgmount 2 drive.qcow2\nboot -l c");
-    }
-
-    #[test]
     fn restore_parses_sockdrive_changes() {
         let url = "https://example.test/drive";
         let persist = [1u8, 2, 3, 4, 5];
@@ -1750,5 +1292,298 @@ imgmount c sockdrive wss://sockdrive.js-dos.com:8001/system/win95
         assert_eq!(&raw[512..], sector_data.as_slice());
 
         remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn doctor_output_dir_uses_bundle_stem_or_doctor_suffix() {
+        assert_eq!(
+            doctor_output_dir(Path::new("/tmp/game.jsdos")),
+            Path::new("/tmp/game")
+        );
+        let dir = std::env::temp_dir();
+        assert_eq!(
+            doctor_output_dir(&dir),
+            dir.with_file_name(format!(
+                "{}.doctor",
+                dir.file_name().unwrap().to_string_lossy()
+            ))
+        );
+    }
+
+    #[test]
+    fn fat32_parser_lists_and_resolves_lfn_fragmented_file() {
+        let dir = test_temp_dir("fat32-parser");
+        let raw_path = dir.join("disk.raw");
+        let file_data = vec![0x33u8; 600];
+        write(&raw_path, create_test_fat32_image(&file_data)).unwrap();
+
+        let mut raw = File::open(&raw_path).unwrap();
+        let fat = read_fat32_info(&mut raw).unwrap();
+        let entries = list_fat32_path(&mut raw, &fat, "/").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Long File.txt");
+
+        let entry = resolve_fat32_path(&mut raw, &fat, "long file.txt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.size, 600);
+        let extents = file_data_extents(&mut raw, &fat, &entry).unwrap();
+        assert_eq!(extents, vec![(2560, 512), (3072, 88)]);
+
+        remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn doctor_patch_updates_plain_ranges() {
+        let dir = test_temp_dir("doctor-patch-plain");
+        let file_data = vec![0x11u8; 600];
+        write_test_doctor_mount(&dir, "2", &create_test_fat32_image(&file_data), &[], &[]);
+        let replacement = vec![0x44u8; 600];
+        let replacement_path = dir.join("replacement.bin");
+        write(&replacement_path, &replacement).unwrap();
+
+        doctor_patch_file(&dir, "2", "/Long File.txt", &replacement_path).unwrap();
+
+        let restored = restore_test_doctor_raw(&dir, "2");
+        assert_eq!(&restored[2560..3072], &replacement[..512]);
+        assert_eq!(&restored[3072..3160], &replacement[512..]);
+
+        remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn doctor_extract_writes_whole_file() {
+        let dir = test_temp_dir("doctor-extract");
+        let file_data = vec![0x22u8; 600];
+        write_test_doctor_mount(&dir, "2", &create_test_fat32_image(&file_data), &[], &[]);
+        let output_path = dir.join("extracted.bin");
+
+        doctor_extract_file_to(&dir, "2", "/Long File.txt", &output_path).unwrap();
+
+        assert_eq!(std::fs::read(output_path).unwrap(), file_data);
+        remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn doctor_patch_updates_small_ranges_preload() {
+        let dir = test_temp_dir("doctor-patch-small");
+        let file_data = vec![0x11u8; 600];
+        write_test_doctor_mount(&dir, "2", &create_test_fat32_image(&file_data), &[5], &[]);
+        let replacement = vec![0x55u8; 600];
+        let replacement_path = dir.join("replacement.bin");
+        write(&replacement_path, &replacement).unwrap();
+
+        doctor_patch_file(&dir, "2", "Long File.txt", &replacement_path).unwrap();
+
+        let preload = std::fs::read(dir.join("2-test-drive/preload.raw")).unwrap();
+        assert_eq!(preload, replacement[..512]);
+        let restored = restore_test_doctor_raw(&dir, "2");
+        assert_eq!(&restored[2560..3072], &replacement[..512]);
+        assert_eq!(&restored[3072..3160], &replacement[512..]);
+
+        remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn doctor_patch_resurrects_dropped_range() {
+        let dir = test_temp_dir("doctor-patch-dropped");
+        let file_data = vec![0x11u8; 600];
+        write_test_doctor_mount(&dir, "2", &create_test_fat32_image(&file_data), &[], &[5]);
+        let replacement = vec![0x66u8; 600];
+        let replacement_path = dir.join("replacement.bin");
+        write(&replacement_path, &replacement).unwrap();
+
+        doctor_patch_file(&dir, "2", "Long File.txt", &replacement_path).unwrap();
+
+        assert!(dir.join("2-test-drive/5.raw").exists());
+        let meta_text = std::fs::read_to_string(dir.join("2-test-drive/sockdrive.metaj")).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&meta_text).unwrap();
+        assert_eq!(
+            meta.get("dropped_ranges").unwrap().as_array().unwrap(),
+            &Vec::<serde_json::Value>::new()
+        );
+        let restored = restore_test_doctor_raw(&dir, "2");
+        assert_eq!(&restored[2560..3072], &replacement[..512]);
+
+        remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn doctor_patch_size_mismatch_keeps_ranges_unchanged() {
+        let dir = test_temp_dir("doctor-patch-size-mismatch");
+        let file_data = vec![0x11u8; 600];
+        write_test_doctor_mount(&dir, "2", &create_test_fat32_image(&file_data), &[], &[]);
+        let before = std::fs::read(dir.join("2-test-drive/5.raw")).unwrap();
+        let replacement_path = dir.join("replacement.bin");
+        write(&replacement_path, vec![0x77u8; 599]).unwrap();
+
+        let error = doctor_patch_file(&dir, "2", "Long File.txt", &replacement_path).unwrap_err();
+        assert!(error.contains("replacement size mismatch"));
+        let after = std::fs::read(dir.join("2-test-drive/5.raw")).unwrap();
+        assert_eq!(before, after);
+
+        remove_dir_all(&dir).unwrap();
+    }
+
+    fn test_temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sockdrive-{}-{}", name, std::process::id()));
+        if dir.exists() {
+            remove_dir_all(&dir).unwrap();
+        }
+        create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_test_doctor_mount(
+        doctor_dir: &Path,
+        drive: &str,
+        image: &[u8],
+        small_ranges: &[u32],
+        dropped_ranges: &[u32],
+    ) {
+        let mount_dir = doctor_dir.join(format!("{}-test-drive", drive));
+        create_dir_all(&mount_dir).unwrap();
+        let ahead_read = 512usize;
+        let range_count = image.len().div_ceil(ahead_read);
+        let meta = serde_json::json!({
+            "name": "test",
+            "size": image.len() / 1024,
+            "ahead_read": ahead_read,
+            "range_count": range_count,
+            "sector_size": 512,
+            "dropped_ranges": dropped_ranges,
+            "small_ranges": small_ranges,
+        });
+        write(
+            mount_dir.join("sockdrive.metaj"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        let small_set: HashSet<u32> = small_ranges.iter().copied().collect();
+        let dropped_set: HashSet<u32> = dropped_ranges.iter().copied().collect();
+        let mut preload = Vec::new();
+        for range in 0..range_count {
+            let start = range * ahead_read;
+            let data = &image[start..start + ahead_read];
+            let range_u32 = range as u32;
+            if dropped_set.contains(&range_u32) {
+                continue;
+            }
+            if small_set.contains(&range_u32) {
+                preload.extend_from_slice(data);
+            } else {
+                write(mount_dir.join(format!("{}.raw", range)), data).unwrap();
+            }
+        }
+        if !small_ranges.is_empty() {
+            write(mount_dir.join("preload.raw"), preload).unwrap();
+        }
+
+        write_doctor_manifest(
+            doctor_dir,
+            "test.jsdos",
+            &[DoctorMount {
+                drive: drive.to_string(),
+                url: "https://example.test/test-drive".to_string(),
+                dir: format!("{}-test-drive", drive),
+            }],
+        )
+        .unwrap();
+    }
+
+    fn restore_test_doctor_raw(doctor_dir: &Path, drive: &str) -> Vec<u8> {
+        let mount = read_doctor_mount(doctor_dir, drive).unwrap();
+        let raw_path = doctor_dir.join("restored.raw");
+        restore_sockdrive_raw_from_dir(&doctor_dir.join(mount.dir), &raw_path).unwrap();
+        std::fs::read(raw_path).unwrap()
+    }
+
+    fn create_test_fat32_image(file_data: &[u8]) -> Vec<u8> {
+        assert!(file_data.len() > 512 && file_data.len() <= 1024);
+        let mut image = vec![0u8; 8192];
+        put_partition(&mut image);
+        put_boot_sector(&mut image[512..1024]);
+        put_fat(&mut image[1024..1536]);
+        put_fat(&mut image[1536..2048]);
+        put_root_dir(&mut image[2048..2560], file_data.len() as u32);
+        image[2560..3072].copy_from_slice(&file_data[..512]);
+        image[3072..3072 + file_data.len() - 512].copy_from_slice(&file_data[512..]);
+        image
+    }
+
+    fn put_partition(image: &mut [u8]) {
+        image[446] = 0x80;
+        image[450] = 0x0b;
+        put_u32(image, 454, 1);
+        put_u32(image, 458, 15);
+        image[510] = 0x55;
+        image[511] = 0xaa;
+    }
+
+    fn put_boot_sector(sector: &mut [u8]) {
+        sector[0] = 0xeb;
+        sector[1] = 0x58;
+        sector[2] = 0x90;
+        sector[3..11].copy_from_slice(b"MSWIN4.1");
+        put_u16(sector, 11, 512);
+        sector[13] = 1;
+        put_u16(sector, 14, 1);
+        sector[16] = 2;
+        sector[21] = 0xf8;
+        put_u32(sector, 28, 1);
+        put_u32(sector, 32, 15);
+        put_u32(sector, 36, 1);
+        put_u32(sector, 44, 2);
+        sector[82..90].copy_from_slice(b"FAT32   ");
+        sector[510] = 0x55;
+        sector[511] = 0xaa;
+    }
+
+    fn put_fat(fat: &mut [u8]) {
+        put_u32(fat, 0, 0x0fff_fff8);
+        put_u32(fat, 4, 0xffff_ffff);
+        put_u32(fat, 8, 0x0fff_ffff);
+        put_u32(fat, 12, 4);
+        put_u32(fat, 16, 0x0fff_ffff);
+    }
+
+    fn put_root_dir(root: &mut [u8], file_size: u32) {
+        put_lfn_entry(&mut root[0..32], "Long File.txt");
+        root[32..43].copy_from_slice(b"LONGFI~1TXT");
+        root[43] = 0x20;
+        put_u16(root, 32 + 20, 0);
+        put_u16(root, 32 + 26, 3);
+        put_u32(root, 32 + 28, file_size);
+    }
+
+    fn put_lfn_entry(entry: &mut [u8], name: &str) {
+        entry.fill(0xff);
+        entry[0] = 0x41;
+        entry[11] = 0x0f;
+        entry[12] = 0;
+        entry[13] = 0;
+        entry[26] = 0;
+        entry[27] = 0;
+        let offsets = [1usize, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+        let chars: Vec<u16> = name.encode_utf16().collect();
+        for (index, offset) in offsets.iter().enumerate() {
+            let value = if index < chars.len() {
+                chars[index]
+            } else if index == chars.len() {
+                0
+            } else {
+                0xffff
+            };
+            put_u16(entry, *offset, value);
+        }
+    }
+
+    fn put_u16(data: &mut [u8], offset: usize, value: u16) {
+        data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(data: &mut [u8], offset: usize, value: u32) {
+        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 }
