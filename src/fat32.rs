@@ -1,7 +1,7 @@
 use std::cmp::min;
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek};
 
 #[derive(Clone, Debug)]
 pub(crate) struct Fat32Info {
@@ -17,6 +17,13 @@ pub(crate) struct Fat32Entry {
     pub(crate) attr: u8,
     pub(crate) first_cluster: u32,
     pub(crate) size: u32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Fat32File {
+    pub(crate) path: String,
+    pub(crate) name: String,
+    pub(crate) entry: Fat32Entry,
 }
 
 impl Fat32Entry {
@@ -257,20 +264,57 @@ pub(crate) fn file_data_extents(
     Ok(extents)
 }
 
-pub(crate) fn write_replacement_to_raw(
+pub(crate) fn list_fat32_files_recursive(
     raw: &mut File,
-    extents: &[(u64, u64)],
-    replacement: &[u8],
+    fat: &Fat32Info,
+) -> Result<Vec<Fat32File>, String> {
+    let mut files = Vec::new();
+    let mut seen_dirs = HashSet::new();
+    list_fat32_files_recursive_at(raw, fat, fat.root_cluster, "", &mut seen_dirs, &mut files)?;
+    Ok(files)
+}
+
+fn list_fat32_files_recursive_at(
+    raw: &mut File,
+    fat: &Fat32Info,
+    cluster: u32,
+    prefix: &str,
+    seen_dirs: &mut HashSet<u32>,
+    files: &mut Vec<Fat32File>,
 ) -> Result<(), String> {
-    let mut source_offset = 0usize;
-    for (offset, len) in extents {
-        let len = *len as usize;
-        raw.seek(std::io::SeekFrom::Start(*offset))
-            .map_err(|e| e.to_string())?;
-        raw.write_all(&replacement[source_offset..source_offset + len])
-            .map_err(|e| e.to_string())?;
-        source_offset += len;
+    if !seen_dirs.insert(cluster) {
+        return Err(format!("FAT32 directory loop at cluster {}", cluster));
     }
+
+    let entries = read_fat32_directory(raw, fat, cluster)?;
+    for entry in entries {
+        let path = if prefix.is_empty() {
+            entry.name.clone()
+        } else {
+            format!("{}/{}", prefix, entry.name)
+        };
+
+        if entry.is_dir() {
+            if entry.first_cluster >= 2 {
+                list_fat32_files_recursive_at(
+                    raw,
+                    fat,
+                    entry.first_cluster,
+                    &path,
+                    seen_dirs,
+                    files,
+                )?;
+            }
+        } else {
+            files.push(Fat32File {
+                path,
+                name: entry.name.clone(),
+                entry,
+            });
+        }
+    }
+
+    seen_dirs.remove(&cluster);
     Ok(())
 }
 

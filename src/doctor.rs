@@ -1,6 +1,6 @@
 use crate::fat32::{
-    file_data_extents, list_fat32_path, read_fat32_info, read_file_extents, resolve_fat32_path,
-    write_replacement_to_raw,
+    file_data_extents, list_fat32_files_recursive, list_fat32_path, read_fat32_info,
+    read_file_extents, resolve_fat32_path,
 };
 use crate::{
     apply_sockdrive_changes, convert_raw_to_qcow2, copy_dir_all, decode_file_len, decode_json_file,
@@ -10,7 +10,7 @@ use crate::{
 };
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
-use std::fs::{create_dir_all, remove_file, File};
+use std::fs::{create_dir_all, read_dir, remove_file, File};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,6 +32,9 @@ pub(crate) fn doctor(args: Vec<String>) {
         && args[2] != "patch"
         && args[2] != "extract"
         && args[2] != "restore"
+        && args[2] != "br"
+        && args[2] != "gz"
+        && args[2] != "verify"
     {
         doctor_download(&args[2]);
         return;
@@ -103,6 +106,76 @@ pub(crate) fn doctor(args: Vec<String>) {
         return;
     }
 
+    if args.len() >= 3 && args[2] == "verify" {
+        let fat32_mode = args.iter().skip(3).any(|arg| arg == "--fat32");
+        let verify_args: Vec<&str> = args
+            .iter()
+            .skip(3)
+            .filter_map(|arg| {
+                if arg == "--fat32" {
+                    None
+                } else {
+                    Some(arg.as_str())
+                }
+            })
+            .collect();
+        if verify_args.len() != 3 {
+            doctor_usage();
+            std::process::exit(1);
+        }
+
+        if fat32_mode {
+            let report = doctor_verify_fat32(
+                Path::new(verify_args[0]),
+                verify_args[1],
+                Path::new(verify_args[2]),
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            });
+            print_fat32_verify_report(&report);
+        } else {
+            let mismatches = doctor_verify_folder(
+                Path::new(verify_args[0]),
+                verify_args[1],
+                Path::new(verify_args[2]),
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            });
+            for mismatch in mismatches {
+                println!("{}", mismatch);
+            }
+        }
+        return;
+    }
+
+    if args.len() >= 3 && (args[2] == "br" || args[2] == "gz") {
+        let doctor_dir = match args.len() {
+            3 => std::env::current_dir().unwrap_or_else(|e| {
+                eprintln!("Error: failed to get current directory: {}", e);
+                std::process::exit(1);
+            }),
+            4 => PathBuf::from(&args[3]),
+            _ => {
+                doctor_usage();
+                std::process::exit(1);
+            }
+        };
+        let encoding = if args[2] == "br" {
+            StoredEncoding::Brotli
+        } else {
+            StoredEncoding::Gzip
+        };
+        doctor_compress(&doctor_dir, encoding).unwrap_or_else(|e| {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        });
+        return;
+    }
+
     if args.len() >= 3 && args[2] == "patch" {
         if args.len() != 7 {
             doctor_usage();
@@ -133,6 +206,10 @@ Usage:
     sockdrive doctor patch <doctor_dir> <drive> <fat_path> <replacement_file>
     sockdrive doctor restore [doctor_dir] [changes.bin]
     sockdrive doctor restore <changes.bin>    # from inside doctor_dir
+    sockdrive doctor verify <doctor_dir> <drive> <folder>
+    sockdrive doctor verify --fat32 <doctor_dir> <drive> <folder>
+    sockdrive doctor br [doctor_dir]
+    sockdrive doctor gz [doctor_dir]
 
     jsdos_bundle: path to a jsdos bundle containing sockdrive mounts
     doctor_dir: directory created by `sockdrive doctor <jsdos_bundle>`
@@ -140,6 +217,9 @@ Usage:
     fat_path: path inside the FAT32 filesystem
     extract writes to the current directory using the FAT32 file name
     restore writes qcow2 images into doctor_dir
+    verify compares optimized drive folders, without recursion
+    verify --fat32 compares FAT32 files against recursive folder files by name, ignore case
+    br/gz write recompressed publishing copies to <doctor_dir>.br or <doctor_dir>.gz
         "
     );
 }
@@ -562,6 +642,532 @@ fn unique_restore_name(
     candidate
 }
 
+#[derive(Clone)]
+enum CompressTaskKind {
+    Json,
+    RawLen(usize),
+}
+
+#[derive(Clone)]
+struct CompressTask {
+    source_path: PathBuf,
+    output_path: PathBuf,
+    kind: CompressTaskKind,
+}
+
+fn doctor_compress(doctor_dir: &Path, encoding: StoredEncoding) -> Result<(), String> {
+    if !doctor_dir.is_dir() {
+        return Err(format!(
+            "doctor directory '{}' does not exist",
+            doctor_dir.display()
+        ));
+    }
+
+    let output_dir = compressed_doctor_output_dir(doctor_dir, encoding)?;
+    if output_dir.exists() {
+        return Err(format!(
+            "compressed doctor directory '{}' exists",
+            output_dir.display()
+        ));
+    }
+
+    let tasks = collect_compress_tasks(doctor_dir, &output_dir)?;
+    if tasks.is_empty() {
+        println!("Nothing to compress in {}", doctor_dir.display());
+        return Ok(());
+    }
+
+    if let Err(e) = create_compressed_doctor_dirs(doctor_dir, &output_dir) {
+        let _ = std::fs::remove_dir_all(&output_dir);
+        return Err(e);
+    }
+    let label = encoding_label(encoding);
+    let workers = min(
+        tasks.len(),
+        std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(4),
+    );
+    let queue = Arc::new(Mutex::new(std::collections::VecDeque::from(tasks)));
+    let error = Arc::new(Mutex::new(None::<String>));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let total = queue.lock().unwrap().len();
+    let mut handles = Vec::new();
+
+    eprintln!(
+        "Compressing {} doctor file(s) to {} with {} workers",
+        total, label, workers
+    );
+
+    for _ in 0..workers {
+        let queue = Arc::clone(&queue);
+        let error = Arc::clone(&error);
+        let completed = Arc::clone(&completed);
+
+        handles.push(thread::spawn(move || loop {
+            if error.lock().unwrap().is_some() {
+                break;
+            }
+
+            let Some(task) = queue.lock().unwrap().pop_front() else {
+                break;
+            };
+
+            if let Err(e) = compress_doctor_file(&task, encoding) {
+                *error.lock().unwrap() = Some(e);
+                break;
+            }
+
+            let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
+            if done == total || done.is_multiple_of(100) {
+                eprintln!("Compressed {}/{} doctor files", done, total);
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| "doctor compression worker panicked".to_string())?;
+    }
+
+    if let Some(error) = error.lock().unwrap().take() {
+        let _ = std::fs::remove_dir_all(&output_dir);
+        return Err(error);
+    }
+
+    println!(
+        "Done, compressed {} doctor file(s) to {} in {}",
+        total,
+        label,
+        output_dir.display()
+    );
+    Ok(())
+}
+
+fn compressed_doctor_output_dir(
+    doctor_dir: &Path,
+    encoding: StoredEncoding,
+) -> Result<PathBuf, String> {
+    let suffix = match encoding {
+        StoredEncoding::Brotli => "br",
+        StoredEncoding::Gzip => "gz",
+        StoredEncoding::Plain => return Err("plain compression is not supported".to_string()),
+    };
+    let source_dir = if doctor_dir == Path::new(".") {
+        std::env::current_dir().map_err(|e| e.to_string())?
+    } else {
+        doctor_dir.to_path_buf()
+    };
+    let name = source_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "failed to build compressed directory name for '{}'",
+                doctor_dir.display()
+            )
+        })?;
+    Ok(source_dir.with_file_name(format!("{}.{}", name, suffix)))
+}
+
+fn create_compressed_doctor_dirs(doctor_dir: &Path, output_dir: &Path) -> Result<(), String> {
+    let mounts = read_doctor_manifest(doctor_dir)?;
+    create_dir_all(output_dir).map_err(|e| e.to_string())?;
+    std::fs::copy(
+        doctor_dir.join("doctor.json"),
+        output_dir.join("doctor.json"),
+    )
+    .map_err(|e| e.to_string())?;
+    for mount in mounts {
+        create_dir_all(output_dir.join(mount.dir)).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn collect_compress_tasks(
+    doctor_dir: &Path,
+    output_dir: &Path,
+) -> Result<Vec<CompressTask>, String> {
+    let mounts = read_doctor_manifest(doctor_dir)?;
+    if mounts.is_empty() {
+        return Err("doctor.json contains no mounts".to_string());
+    }
+
+    let mut tasks = Vec::new();
+    for mount in mounts {
+        let mount_dir = doctor_dir.join(&mount.dir);
+        if !mount_dir.is_dir() {
+            return Err(format!(
+                "mount directory '{}' does not exist",
+                mount_dir.display()
+            ));
+        }
+
+        let meta_path = mount_dir.join("sockdrive.metaj");
+        let (_, meta, _) = read_sockdrive_meta_file(&meta_path)?;
+        tasks.push(CompressTask {
+            source_path: meta_path,
+            output_path: output_dir.join(&mount.dir).join("sockdrive.metaj"),
+            kind: CompressTaskKind::Json,
+        });
+
+        if !meta.small_ranges.is_empty() {
+            let preload_path = mount_dir.join("preload.raw");
+            if !preload_path.exists() {
+                return Err(format!(
+                    "preload file '{}' does not exist",
+                    preload_path.display()
+                ));
+            }
+            tasks.push(CompressTask {
+                source_path: preload_path,
+                output_path: output_dir.join(&mount.dir).join("preload.raw"),
+                kind: CompressTaskKind::RawLen(meta.small_ranges.len() * meta.ahead_read as usize),
+            });
+        }
+
+        let dropped: HashSet<u32> = meta.dropped_ranges.iter().copied().collect();
+        let small: HashSet<u32> = meta.small_ranges.iter().copied().collect();
+        let raw_size = meta.size_kb * 1024;
+        for range in 0..meta.range_count {
+            let range_u32 = range as u32;
+            if range * meta.ahead_read >= raw_size
+                || dropped.contains(&range_u32)
+                || small.contains(&range_u32)
+            {
+                continue;
+            }
+
+            let range_path = mount_dir.join(format!("{}.raw", range));
+            if !range_path.exists() {
+                return Err(format!(
+                    "range file '{}' does not exist",
+                    range_path.display()
+                ));
+            }
+            tasks.push(CompressTask {
+                source_path: range_path,
+                output_path: output_dir.join(&mount.dir).join(format!("{}.raw", range)),
+                kind: CompressTaskKind::RawLen(meta.ahead_read as usize),
+            });
+        }
+    }
+
+    Ok(tasks)
+}
+
+fn compress_doctor_file(task: &CompressTask, encoding: StoredEncoding) -> Result<(), String> {
+    let data = match task.kind {
+        CompressTaskKind::Json => decode_json_file(&task.source_path)?.0,
+        CompressTaskKind::RawLen(expected_len) => {
+            decode_file_len(&task.source_path, expected_len)?.0
+        }
+    };
+    encode_file_mkd_style(&task.output_path, &data, encoding)
+}
+
+fn encode_file_mkd_style(
+    output_path: &Path,
+    data: &[u8],
+    encoding: StoredEncoding,
+) -> Result<(), String> {
+    let (command_name, best_arg, fast_arg, suffix) = match encoding {
+        StoredEncoding::Brotli => ("brotli", "-Z", "-0", "br"),
+        StoredEncoding::Gzip => ("gzip", "-9", "-1", "gz"),
+        StoredEncoding::Plain => return Err("plain compression is not supported".to_string()),
+    };
+    let (compressed, compressed_len) =
+        compress_to_temp(output_path, data, command_name, best_arg, suffix)?;
+    if compressed_len < data.len() as u64 {
+        std::fs::rename(&compressed, output_path).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    let _ = remove_file(&compressed);
+    let (compressed, _) = compress_to_temp(output_path, data, command_name, fast_arg, suffix)?;
+    std::fs::rename(&compressed, output_path).map_err(|e| e.to_string())
+}
+
+fn compress_to_temp(
+    output_path: &Path,
+    data: &[u8],
+    command_name: &str,
+    compression_arg: &str,
+    suffix: &str,
+) -> Result<(PathBuf, u64), String> {
+    let tmp = output_path.with_extension(format!(
+        "compress-tmp-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let compressed_tmp = tmp.with_extension(format!(
+        "{}.{}",
+        tmp.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("compress-tmp"),
+        suffix
+    ));
+
+    std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
+    let status = Command::new(command_name)
+        .arg(compression_arg)
+        .arg("-k")
+        .arg(&tmp)
+        .status()
+        .map_err(|e| format!("failed to run {}: {}", command_name, e))?;
+    let _ = remove_file(&tmp);
+    if !status.success() {
+        let _ = remove_file(&compressed_tmp);
+        return Err(format!("{} failed", command_name));
+    }
+
+    let compressed_len = std::fs::metadata(&compressed_tmp)
+        .map_err(|e| e.to_string())?
+        .len();
+    Ok((compressed_tmp, compressed_len))
+}
+
+fn encoding_label(encoding: StoredEncoding) -> &'static str {
+    match encoding {
+        StoredEncoding::Plain => "plain",
+        StoredEncoding::Gzip => "gzip",
+        StoredEncoding::Brotli => "brotli",
+    }
+}
+
+struct LocalVerifyEntry {
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
+}
+
+pub(crate) struct Fat32VerifyReport {
+    pub(crate) matched: usize,
+    pub(crate) not_found: usize,
+    pub(crate) not_matched: Vec<String>,
+    pub(crate) ambiguous_match: Vec<String>,
+}
+
+fn print_fat32_verify_report(report: &Fat32VerifyReport) {
+    println!("MATCHED - {} files", report.matched);
+    println!("NOT FOUND - {} files", report.not_found);
+    println!("AMBIGUOUS MATCH - {} files", report.ambiguous_match.len());
+    for path in &report.ambiguous_match {
+        println!("- {}", path);
+    }
+    println!("NOT MATCHED:");
+    for path in &report.not_matched {
+        println!("- {}", path);
+    }
+}
+
+pub(crate) fn doctor_verify_folder(
+    doctor_dir: &Path,
+    drive: &str,
+    folder: &Path,
+) -> Result<Vec<String>, String> {
+    let mount = read_doctor_mount(doctor_dir, drive)?;
+    let source_dir = doctor_dir.join(&mount.dir);
+    if !source_dir.is_dir() {
+        return Err(format!(
+            "mount directory '{}' does not exist",
+            source_dir.display()
+        ));
+    }
+    let target_dir = resolve_verify_target_dir(folder, drive)?;
+    compare_verify_dirs(&source_dir, &target_dir, &mount.dir)
+}
+
+pub(crate) fn doctor_verify_fat32(
+    doctor_dir: &Path,
+    drive: &str,
+    folder: &Path,
+) -> Result<Fat32VerifyReport, String> {
+    if !folder.is_dir() {
+        return Err(format!("folder '{}' does not exist", folder.display()));
+    }
+
+    let local_files = read_recursive_verify_files(folder)?;
+    let mount = read_doctor_mount(doctor_dir, drive)?;
+    let mount_dir = doctor_dir.join(&mount.dir);
+    let raw_path = temp_raw_path("verify-fat32", drive);
+    restore_sockdrive_raw_from_dir(&mount_dir, &raw_path)?;
+
+    let result = (|| {
+        let mut raw = File::open(&raw_path).map_err(|e| e.to_string())?;
+        let fat = read_fat32_info(&mut raw)?;
+        let mut matched = 0usize;
+        let mut not_found = 0usize;
+        let mut not_matched = Vec::new();
+        let mut ambiguous_match = Vec::new();
+
+        for fat_file in list_fat32_files_recursive(&mut raw, &fat)? {
+            let Some(local_matches) = local_files.get(&verify_name_key(&fat_file.name)) else {
+                not_found += 1;
+                continue;
+            };
+            if local_matches.len() > 1 {
+                ambiguous_match.push(fat_file.path);
+                continue;
+            }
+            let local_file = &local_matches[0];
+            let local_data = std::fs::read(&local_file.path).map_err(|e| e.to_string())?;
+            if local_data.len() != fat_file.entry.size as usize {
+                not_matched.push(fat_file.path);
+                continue;
+            }
+
+            let extents = file_data_extents(&mut raw, &fat, &fat_file.entry)?;
+            let fat_data = read_file_extents(&mut raw, &extents)?;
+            if fat_data == local_data {
+                matched += 1;
+            } else {
+                not_matched.push(fat_file.path);
+            }
+        }
+
+        not_matched.sort();
+        ambiguous_match.sort();
+        Ok::<Fat32VerifyReport, String>(Fat32VerifyReport {
+            matched,
+            not_found,
+            not_matched,
+            ambiguous_match,
+        })
+    })();
+
+    let _ = remove_file(&raw_path);
+    result
+}
+
+fn resolve_verify_target_dir(folder: &Path, drive: &str) -> Result<PathBuf, String> {
+    if !folder.is_dir() {
+        return Err(format!("folder '{}' does not exist", folder.display()));
+    }
+    if folder.join("doctor.json").exists() {
+        let mount = read_doctor_mount(folder, drive)?;
+        let mount_dir = folder.join(&mount.dir);
+        if !mount_dir.is_dir() {
+            return Err(format!(
+                "mount directory '{}' does not exist",
+                mount_dir.display()
+            ));
+        }
+        return Ok(mount_dir);
+    }
+
+    Ok(folder.to_path_buf())
+}
+
+fn compare_verify_dirs(
+    source_dir: &Path,
+    target_dir: &Path,
+    output_prefix: &str,
+) -> Result<Vec<String>, String> {
+    let source_entries = read_local_verify_entries(source_dir)?;
+    let mut target_entries = read_local_verify_entries(target_dir)?;
+    let mut mismatches = Vec::new();
+
+    for (_, source_entry) in source_entries {
+        let Some(target_entry) = target_entries.remove(&verify_name_key(&source_entry.name)) else {
+            mismatches.push(format!("{}/{}", output_prefix, source_entry.name));
+            continue;
+        };
+
+        if source_entry.is_dir || target_entry.is_dir {
+            if source_entry.is_dir != target_entry.is_dir {
+                mismatches.push(format!("{}/{}", output_prefix, source_entry.name));
+            }
+            continue;
+        }
+
+        let source_data = std::fs::read(&source_entry.path).map_err(|e| e.to_string())?;
+        let target_data = std::fs::read(&target_entry.path).map_err(|e| e.to_string())?;
+        if source_data != target_data {
+            mismatches.push(format!("{}/{}", output_prefix, source_entry.name));
+        }
+    }
+
+    for (_, entry) in target_entries {
+        mismatches.push(format!("{}/{}", output_prefix, entry.name));
+    }
+
+    mismatches.sort();
+    Ok(mismatches)
+}
+
+fn read_local_verify_entries(folder: &Path) -> Result<HashMap<String, LocalVerifyEntry>, String> {
+    let mut entries = HashMap::new();
+    for entry in read_dir(folder).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let key = verify_name_key(&name);
+        if entries
+            .insert(
+                key.clone(),
+                LocalVerifyEntry {
+                    name,
+                    path: entry.path(),
+                    is_dir: file_type.is_dir(),
+                },
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "folder '{}' contains duplicate case-insensitive entry '{}'",
+                folder.display(),
+                key
+            ));
+        }
+    }
+    Ok(entries)
+}
+
+fn read_recursive_verify_files(
+    folder: &Path,
+) -> Result<HashMap<String, Vec<LocalVerifyEntry>>, String> {
+    let mut files = HashMap::new();
+    read_recursive_verify_files_at(folder, &mut files)?;
+    Ok(files)
+}
+
+fn read_recursive_verify_files_at(
+    folder: &Path,
+    files: &mut HashMap<String, Vec<LocalVerifyEntry>>,
+) -> Result<(), String> {
+    for entry in read_dir(folder).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if file_type.is_dir() {
+            read_recursive_verify_files_at(&entry.path(), files)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().to_string();
+        let key = verify_name_key(&name);
+        files.entry(key).or_default().push(LocalVerifyEntry {
+            name,
+            path: entry.path(),
+            is_dir: false,
+        });
+    }
+
+    Ok(())
+}
+
+fn verify_name_key(name: &str) -> String {
+    name.to_lowercase()
+}
+
 fn doctor_ls(doctor_dir: &Path, drive: &str, fat_path: Option<&str>) -> Result<(), String> {
     let mount = read_doctor_mount(doctor_dir, drive)?;
     let mount_dir = doctor_dir.join(&mount.dir);
@@ -642,7 +1248,7 @@ pub(crate) fn doctor_patch_file(
     drive: &str,
     fat_path: &str,
     replacement_file: &Path,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     if !replacement_file.exists() {
         return Err(format!(
             "replacement file '{}' does not exist",
@@ -677,15 +1283,13 @@ pub(crate) fn doctor_patch_file(
         }
 
         let extents = file_data_extents(&mut raw, &fat, &entry)?;
-        write_replacement_to_raw(&mut raw, &extents, &replacement)?;
-        patch_sockdrive_ranges_from_raw(&mount_dir, &mut raw, &extents)?;
-        println!(
-            "Patched '{}' in drive {} using {}",
-            fat_path,
-            drive,
-            replacement_file.display()
-        );
-        Ok::<(), String>(())
+        let changed_extents = write_changed_replacement_to_raw(&mut raw, &extents, &replacement)?;
+        let updated_files =
+            patch_sockdrive_ranges_from_raw(&mount_dir, &mount.dir, &mut raw, &changed_extents)?;
+        for file in &updated_files {
+            println!("{}", file);
+        }
+        Ok::<Vec<String>, String>(updated_files)
     })();
 
     let _ = remove_file(&raw_path);
@@ -760,9 +1364,10 @@ pub(crate) fn restore_sockdrive_raw_from_dir(
 
 fn patch_sockdrive_ranges_from_raw(
     mount_dir: &Path,
+    mount_dir_name: &str,
     raw: &mut File,
     extents: &[(u64, u64)],
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let meta_path = mount_dir.join("sockdrive.metaj");
     let (mut meta_value, mut meta, meta_encoding) = read_sockdrive_meta_file(&meta_path)?;
     let raw_size = meta.size_kb * 1024;
@@ -782,6 +1387,7 @@ fn patch_sockdrive_ranges_from_raw(
     affected.sort_unstable();
 
     let mut preload = None::<(Vec<u8>, StoredEncoding)>;
+    let mut updated_files = Vec::new();
     let mut dropped_changed = false;
     for range in affected {
         if range >= meta.range_count {
@@ -800,6 +1406,10 @@ fn patch_sockdrive_ranges_from_raw(
             let (preload_data, _) = preload.as_mut().unwrap();
             let start = small_index * meta.ahead_read as usize;
             preload_data[start..start + meta.ahead_read as usize].copy_from_slice(&range_data);
+            let preload_file = format!("{}/preload.raw", mount_dir_name);
+            if !updated_files.iter().any(|file| file == &preload_file) {
+                updated_files.push(preload_file);
+            }
         } else {
             let range_path = mount_dir.join(format!("{}.raw", range));
             let encoding = if range_path.exists() {
@@ -815,6 +1425,7 @@ fn patch_sockdrive_ranges_from_raw(
                 ));
             };
             encode_file(&range_path, &range_data, encoding)?;
+            updated_files.push(format!("{}/{}.raw", mount_dir_name, range));
         }
     }
 
@@ -831,7 +1442,55 @@ fn patch_sockdrive_ranges_from_raw(
         encode_file(&meta_path, text.as_bytes(), meta_encoding)?;
     }
 
-    Ok(())
+    Ok(updated_files)
+}
+
+fn write_changed_replacement_to_raw(
+    raw: &mut File,
+    extents: &[(u64, u64)],
+    replacement: &[u8],
+) -> Result<Vec<(u64, u64)>, String> {
+    let mut source_offset = 0usize;
+    let mut changed_extents = Vec::new();
+    for (raw_offset, len) in extents {
+        let len = *len as usize;
+        let replacement_slice = &replacement[source_offset..source_offset + len];
+        let mut original = vec![0u8; len];
+        raw.seek(std::io::SeekFrom::Start(*raw_offset))
+            .map_err(|e| e.to_string())?;
+        raw.read_exact(&mut original).map_err(|e| e.to_string())?;
+
+        for (start, end) in changed_runs(&original, replacement_slice) {
+            raw.seek(std::io::SeekFrom::Start(*raw_offset + start as u64))
+                .map_err(|e| e.to_string())?;
+            raw.write_all(&replacement_slice[start..end])
+                .map_err(|e| e.to_string())?;
+            changed_extents.push((*raw_offset + start as u64, (end - start) as u64));
+        }
+
+        source_offset += len;
+    }
+
+    Ok(changed_extents)
+}
+
+fn changed_runs(original: &[u8], replacement: &[u8]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut offset = 0usize;
+    while offset < replacement.len() {
+        if original[offset] == replacement[offset] {
+            offset += 1;
+            continue;
+        }
+
+        let start = offset;
+        offset += 1;
+        while offset < replacement.len() && original[offset] != replacement[offset] {
+            offset += 1;
+        }
+        runs.push((start, offset));
+    }
+    runs
 }
 
 fn read_raw_range(

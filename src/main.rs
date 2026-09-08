@@ -1140,8 +1140,9 @@ pub(crate) fn copy_dir_all(
 mod tests {
     use super::*;
     use crate::doctor::{
-        doctor_extract_file_to, doctor_output_dir, doctor_patch_file, read_doctor_mount,
-        restore_sockdrive_raw_from_dir, write_doctor_manifest, DoctorMount,
+        doctor_extract_file_to, doctor_output_dir, doctor_patch_file, doctor_verify_fat32,
+        doctor_verify_folder, read_doctor_mount, restore_sockdrive_raw_from_dir,
+        write_doctor_manifest, DoctorMount,
     };
     use crate::fat32::{file_data_extents, list_fat32_path, read_fat32_info, resolve_fat32_path};
     use std::fs::remove_dir_all;
@@ -1342,10 +1343,41 @@ imgmount c sockdrive wss://sockdrive.js-dos.com:8001/system/win95
         let replacement_path = dir.join("replacement.bin");
         write(&replacement_path, &replacement).unwrap();
 
-        doctor_patch_file(&dir, "2", "/Long File.txt", &replacement_path).unwrap();
+        let updated = doctor_patch_file(&dir, "2", "/Long File.txt", &replacement_path).unwrap();
+        assert_eq!(updated, vec!["2-test-drive/5.raw", "2-test-drive/6.raw"]);
 
         let restored = restore_test_doctor_raw(&dir, "2");
         assert_eq!(&restored[2560..3072], &replacement[..512]);
+        assert_eq!(&restored[3072..3160], &replacement[512..]);
+
+        remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn doctor_patch_reports_and_writes_only_changed_ranges() {
+        let dir = test_temp_dir("doctor-patch-only-changed");
+        let file_data = vec![0x11u8; 600];
+        write_test_doctor_mount(&dir, "2", &create_test_fat32_image(&file_data), &[], &[]);
+        let before_5 = std::fs::read(dir.join("2-test-drive/5.raw")).unwrap();
+        let before_6 = std::fs::read(dir.join("2-test-drive/6.raw")).unwrap();
+        let mut replacement = file_data.clone();
+        replacement[512..].fill(0x44);
+        let replacement_path = dir.join("replacement.bin");
+        write(&replacement_path, &replacement).unwrap();
+
+        let updated = doctor_patch_file(&dir, "2", "/Long File.txt", &replacement_path).unwrap();
+
+        assert_eq!(updated, vec!["2-test-drive/6.raw"]);
+        assert_eq!(
+            std::fs::read(dir.join("2-test-drive/5.raw")).unwrap(),
+            before_5
+        );
+        assert_ne!(
+            std::fs::read(dir.join("2-test-drive/6.raw")).unwrap(),
+            before_6
+        );
+        let restored = restore_test_doctor_raw(&dir, "2");
+        assert_eq!(&restored[2560..3072], &file_data[..512]);
         assert_eq!(&restored[3072..3160], &replacement[512..]);
 
         remove_dir_all(&dir).unwrap();
@@ -1365,6 +1397,141 @@ imgmount c sockdrive wss://sockdrive.js-dos.com:8001/system/win95
     }
 
     #[test]
+    fn doctor_verify_accepts_matching_drive_folder() {
+        let dir = test_temp_dir("doctor-verify-match");
+        let other_dir = test_temp_dir("doctor-verify-match-other");
+        let file_data = vec![0x22u8; 600];
+        write_test_doctor_mount(&dir, "2", &create_test_fat32_image(&file_data), &[], &[]);
+        write_test_doctor_mount(
+            &other_dir,
+            "2",
+            &create_test_fat32_image(&file_data),
+            &[],
+            &[],
+        );
+
+        let mismatches = doctor_verify_folder(&dir, "2", &other_dir).unwrap();
+
+        assert!(mismatches.is_empty());
+        remove_dir_all(&dir).unwrap();
+        remove_dir_all(&other_dir).unwrap();
+    }
+
+    #[test]
+    fn doctor_verify_reports_non_matching_drive_folder_files() {
+        let dir = test_temp_dir("doctor-verify-mismatch");
+        let other_dir = test_temp_dir("doctor-verify-mismatch-other");
+        let file_data = vec![0x22u8; 600];
+        write_test_doctor_mount(&dir, "2", &create_test_fat32_image(&file_data), &[], &[]);
+        write_test_doctor_mount(
+            &other_dir,
+            "2",
+            &create_test_fat32_image(&file_data),
+            &[],
+            &[],
+        );
+        write(other_dir.join("2-test-drive/6.raw"), vec![0x33u8; 512]).unwrap();
+        write(other_dir.join("2-test-drive/extra.raw"), b"extra").unwrap();
+
+        let mismatches = doctor_verify_folder(&dir, "2", &other_dir).unwrap();
+
+        assert_eq!(
+            mismatches,
+            vec!["2-test-drive/6.raw", "2-test-drive/extra.raw"]
+        );
+        remove_dir_all(&dir).unwrap();
+        remove_dir_all(&other_dir).unwrap();
+    }
+
+    #[test]
+    fn doctor_verify_fat32_matches_recursive_local_files_by_name() {
+        let dir = test_temp_dir("doctor-verify-fat32-match");
+        let folder = dir.join("folder");
+        let nested = folder.join("nested");
+        let file_data = vec![0x22u8; 600];
+        write_test_doctor_mount(&dir, "2", &create_test_fat32_image(&file_data), &[], &[]);
+        create_dir_all(&nested).unwrap();
+        write(nested.join("long file.TXT"), &file_data).unwrap();
+
+        let report = doctor_verify_fat32(&dir, "2", &folder).unwrap();
+
+        assert_eq!(report.matched, 1);
+        assert_eq!(report.not_found, 0);
+        assert!(report.not_matched.is_empty());
+        assert!(report.ambiguous_match.is_empty());
+        remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn doctor_verify_fat32_reports_missing_and_mismatched_files() {
+        let dir = test_temp_dir("doctor-verify-fat32-mismatch");
+        let folder = dir.join("folder");
+        let file_data = vec![0x22u8; 300];
+        write_test_doctor_mount(
+            &dir,
+            "2",
+            &create_test_fat32_nested_image(&file_data),
+            &[],
+            &[],
+        );
+        create_dir_all(&folder).unwrap();
+        write(folder.join("nested.bin"), vec![0x33u8; 300]).unwrap();
+
+        let report = doctor_verify_fat32(&dir, "2", &folder).unwrap();
+
+        assert_eq!(report.matched, 0);
+        assert_eq!(report.not_found, 0);
+        assert_eq!(report.not_matched, vec!["SUBDIR/NESTED.BIN"]);
+        assert!(report.ambiguous_match.is_empty());
+        remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn doctor_verify_fat32_reports_ambiguous_local_matches() {
+        let dir = test_temp_dir("doctor-verify-fat32-ambiguous");
+        let folder = dir.join("folder");
+        let first = folder.join("first");
+        let second = folder.join("second");
+        let file_data = vec![0x22u8; 600];
+        write_test_doctor_mount(&dir, "2", &create_test_fat32_image(&file_data), &[], &[]);
+        create_dir_all(&first).unwrap();
+        create_dir_all(&second).unwrap();
+        write(first.join("Long File.txt"), &file_data).unwrap();
+        write(second.join("long file.TXT"), &file_data).unwrap();
+
+        let report = doctor_verify_fat32(&dir, "2", &folder).unwrap();
+
+        assert_eq!(report.matched, 0);
+        assert_eq!(report.not_found, 0);
+        assert!(report.not_matched.is_empty());
+        assert_eq!(report.ambiguous_match, vec!["Long File.txt"]);
+        remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn doctor_verify_fat32_counts_not_found_files() {
+        let dir = test_temp_dir("doctor-verify-fat32-not-found");
+        let folder = dir.join("folder");
+        let file_data = vec![0x22u8; 300];
+        write_test_doctor_mount(
+            &dir,
+            "2",
+            &create_test_fat32_nested_image(&file_data),
+            &[],
+            &[],
+        );
+        create_dir_all(&folder).unwrap();
+
+        let report = doctor_verify_fat32(&dir, "2", &folder).unwrap();
+
+        assert_eq!(report.matched, 0);
+        assert_eq!(report.not_found, 1);
+        assert!(report.not_matched.is_empty());
+        assert!(report.ambiguous_match.is_empty());
+        remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn doctor_patch_updates_small_ranges_preload() {
         let dir = test_temp_dir("doctor-patch-small");
         let file_data = vec![0x11u8; 600];
@@ -1373,7 +1540,11 @@ imgmount c sockdrive wss://sockdrive.js-dos.com:8001/system/win95
         let replacement_path = dir.join("replacement.bin");
         write(&replacement_path, &replacement).unwrap();
 
-        doctor_patch_file(&dir, "2", "Long File.txt", &replacement_path).unwrap();
+        let updated = doctor_patch_file(&dir, "2", "Long File.txt", &replacement_path).unwrap();
+        assert_eq!(
+            updated,
+            vec!["2-test-drive/preload.raw", "2-test-drive/6.raw"]
+        );
 
         let preload = std::fs::read(dir.join("2-test-drive/preload.raw")).unwrap();
         assert_eq!(preload, replacement[..512]);
@@ -1393,7 +1564,8 @@ imgmount c sockdrive wss://sockdrive.js-dos.com:8001/system/win95
         let replacement_path = dir.join("replacement.bin");
         write(&replacement_path, &replacement).unwrap();
 
-        doctor_patch_file(&dir, "2", "Long File.txt", &replacement_path).unwrap();
+        let updated = doctor_patch_file(&dir, "2", "Long File.txt", &replacement_path).unwrap();
+        assert_eq!(updated, vec!["2-test-drive/5.raw", "2-test-drive/6.raw"]);
 
         assert!(dir.join("2-test-drive/5.raw").exists());
         let meta_text = std::fs::read_to_string(dir.join("2-test-drive/sockdrive.metaj")).unwrap();
@@ -1512,6 +1684,19 @@ imgmount c sockdrive wss://sockdrive.js-dos.com:8001/system/win95
         image
     }
 
+    fn create_test_fat32_nested_image(file_data: &[u8]) -> Vec<u8> {
+        assert!(file_data.len() <= 512);
+        let mut image = vec![0u8; 8192];
+        put_partition(&mut image);
+        put_boot_sector(&mut image[512..1024]);
+        put_nested_fat(&mut image[1024..1536]);
+        put_nested_fat(&mut image[1536..2048]);
+        put_subdir_root(&mut image[2048..2560]);
+        put_nested_dir(&mut image[2560..3072], file_data.len() as u32);
+        image[3072..3072 + file_data.len()].copy_from_slice(file_data);
+        image
+    }
+
     fn put_partition(image: &mut [u8]) {
         image[446] = 0x80;
         image[450] = 0x0b;
@@ -1548,6 +1733,14 @@ imgmount c sockdrive wss://sockdrive.js-dos.com:8001/system/win95
         put_u32(fat, 16, 0x0fff_ffff);
     }
 
+    fn put_nested_fat(fat: &mut [u8]) {
+        put_u32(fat, 0, 0x0fff_fff8);
+        put_u32(fat, 4, 0xffff_ffff);
+        put_u32(fat, 8, 0x0fff_ffff);
+        put_u32(fat, 12, 0x0fff_ffff);
+        put_u32(fat, 16, 0x0fff_ffff);
+    }
+
     fn put_root_dir(root: &mut [u8], file_size: u32) {
         put_lfn_entry(&mut root[0..32], "Long File.txt");
         root[32..43].copy_from_slice(b"LONGFI~1TXT");
@@ -1555,6 +1748,21 @@ imgmount c sockdrive wss://sockdrive.js-dos.com:8001/system/win95
         put_u16(root, 32 + 20, 0);
         put_u16(root, 32 + 26, 3);
         put_u32(root, 32 + 28, file_size);
+    }
+
+    fn put_subdir_root(root: &mut [u8]) {
+        root[0..11].copy_from_slice(b"SUBDIR     ");
+        root[11] = 0x10;
+        put_u16(root, 20, 0);
+        put_u16(root, 26, 3);
+    }
+
+    fn put_nested_dir(dir: &mut [u8], file_size: u32) {
+        dir[0..11].copy_from_slice(b"NESTED  BIN");
+        dir[11] = 0x20;
+        put_u16(dir, 20, 0);
+        put_u16(dir, 26, 4);
+        put_u32(dir, 28, file_size);
     }
 
     fn put_lfn_entry(entry: &mut [u8], name: &str) {
